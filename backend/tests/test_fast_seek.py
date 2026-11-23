@@ -11,6 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.services.fast_stream_engine import FastStreamEngine, MediaStreamSession, SLICE_SIZE, MAX_MEM_CACHE_PER_MEDIA
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_governor():
+    from app.services.rate_governor import rate_governor
+    rate_governor.reset()
+    yield
+    rate_governor.reset()
+
+
 def test_session_slice_range_and_availability():
     """Validates 1MB slice calculation and presence in memory."""
     session = MediaStreamSession("chat123", 100, 100 * 1024 * 1024, "video.mp4")
@@ -888,10 +896,11 @@ async def test_download_media_subtitles_endpoint(tmp_path):
     from telethon.tl.types import MessageMediaDocument, Document
 
     # 1. Test fallback blank subtitle when no cached file exists
-    res = await download_media_subtitles("chat_sub", 1001)
-    assert res.status_code == 200
-    assert res.media_type == "text/plain; charset=utf-8"
-    assert b"00:00:00,000" in res.body
+    with patch("app.services.subtitle_service.subtitle_service.get_or_download_subtitle", AsyncMock(return_value=None)):
+        res = await download_media_subtitles("chat_sub", 1001)
+        assert res.status_code == 200
+        assert res.media_type == "text/plain; charset=utf-8"
+        assert b"00:00:00,000" in res.body
 
     # 2. Test cached subtitle delivery
     sub_file = SUBTITLES_DIR / "test_movie.eng.srt"

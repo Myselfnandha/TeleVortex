@@ -86,8 +86,37 @@ class SeekEpisodeManager:
         return w_start in ep.candidate_windows
 
 
+class ChunkTimingMetrics:
+    """Accurate monotonic-clock stage timing telemetry for chunk pipeline."""
+    def __init__(
+        self,
+        t_admission: float = 0.0,
+        t_queue_start: float = 0.0,
+        t_queue_wait_ms: float = 0.0,
+        t_rate_wait_ms: float = 0.0,
+        t_lease_wait_ms: float = 0.0,
+        t_wire_ms: float = 0.0,
+        t_rust_wire_ms: float = 0.0,
+        t_py_wire_ms: float = 0.0,
+        t_fallback_ms: float = 0.0,
+        t_first_yield_ms: float = 0.0,
+        source: str = "wire"
+    ):
+        self.t_admission = t_admission
+        self.t_queue_start = t_queue_start
+        self.t_queue_wait_ms = t_queue_wait_ms
+        self.t_rate_wait_ms = t_rate_wait_ms
+        self.t_lease_wait_ms = t_lease_wait_ms
+        self.t_wire_ms = t_wire_ms
+        self.t_rust_wire_ms = t_rust_wire_ms
+        self.t_py_wire_ms = t_py_wire_ms
+        self.t_fallback_ms = t_fallback_ms
+        self.t_first_yield_ms = t_first_yield_ms
+        self.source = source
+
+
 class ChunkTask:
-    def __init__(self, key: Tuple[str, int, int], generation: int = 0, is_urgent: bool = False):
+    def __init__(self, key: Tuple[Any, ...], generation: int = 0, is_urgent: bool = False, metrics: Optional[ChunkTimingMetrics] = None):
         self.key = key
         self.generation = generation
         self.is_urgent = is_urgent
@@ -97,26 +126,54 @@ class ChunkTask:
         self.created_at: float = time.time()
         self.wire_task: Optional[asyncio.Task] = None
         self.completed: bool = False
-        # SFASE v1.0 Diagnostic Telemetry (ms)
-        self.t_queue: float = 0.0
-        self.t_rate: float = 0.0
-        self.t_wire: float = 0.0
-        self.source: str = "wire"
+        self.metrics: ChunkTimingMetrics = metrics or ChunkTimingMetrics(t_queue_start=time.monotonic())
+
+    @property
+    def t_queue(self) -> float:
+        return self.metrics.t_queue_wait_ms
+
+    @t_queue.setter
+    def t_queue(self, val: float):
+        self.metrics.t_queue_wait_ms = val
+
+    @property
+    def t_rate(self) -> float:
+        return self.metrics.t_rate_wait_ms
+
+    @t_rate.setter
+    def t_rate(self, val: float):
+        self.metrics.t_rate_wait_ms = val
+
+    @property
+    def t_wire(self) -> float:
+        return self.metrics.t_wire_ms
+
+    @t_wire.setter
+    def t_wire(self, val: float):
+        self.metrics.t_wire_ms = val
+
+    @property
+    def source(self) -> str:
+        return self.metrics.source
+
+    @source.setter
+    def source(self, val: str):
+        self.metrics.source = val
 
 
 class StreamEngine:
     def __init__(self):
-        self._in_flight_chunks: Dict[Tuple[str, int, int], asyncio.Future] = {}
-        self._chunk_task_registry: Dict[Tuple[str, int, int], ChunkTask] = {}
+        self._in_flight_chunks: Dict[Tuple[Any, ...], asyncio.Future] = {}
+        self._chunk_task_registry: Dict[Tuple[Any, ...], ChunkTask] = {}
         self.seek_episode_manager = SeekEpisodeManager()
         self._chunk_lock: Optional[asyncio.Lock] = None
         self._mtproto_sem: Optional[asyncio.Semaphore] = None
         self._active_stream_wire_tasks: Dict[Tuple[str, int], Set[asyncio.Task]] = {}
         self._active_stop_events: Dict[Tuple[str, int], Set[asyncio.Event]] = {}
-        self._seek_generations: Dict[Tuple[str, int], int] = {}
-        self._active_read_positions: Dict[Tuple[str, int], int] = {}
+        self._seek_generations: Dict[Tuple[str, str, str, int, str], int] = {}
+        self._active_read_positions: Dict[Tuple[str, str, str, int, str], int] = {}
         self._retained_cleanup_tasks: Set[asyncio.Task] = set()
-        self._generation_stop_events: Dict[Tuple[str, int, int], asyncio.Event] = {}
+        self._generation_stop_events: Dict[Tuple[Tuple[str, str, str, int, str], int], asyncio.Event] = {}
 
     def _get_chunk_lock(self) -> asyncio.Lock:
         if self._chunk_lock is None:
@@ -128,32 +185,67 @@ class StreamEngine:
             self._mtproto_sem = asyncio.Semaphore(16)
         return self._mtproto_sem
 
-    def get_seek_generation(self, chat_id: Union[str, int], message_id: int) -> int:
+    def _scope_key(
+        self,
+        chat_id: Union[str, int],
+        message_id: int,
+        tenant_id: str = "default",
+        account_id: str = "default",
+        session_id: str = "default"
+    ) -> Tuple[str, str, str, int, str]:
         norm_cid = StreamSlidingBuffer._canonical_cid(chat_id)
-        return self._seek_generations.get((norm_cid, int(message_id)), 0)
+        return (str(tenant_id), str(account_id), norm_cid, int(message_id), str(session_id))
 
-    def advance_seek_generation(self, chat_id: Union[str, int], message_id: int, new_offset: int, chunk_size: int = 512 * 1024) -> int:
+    def get_seek_generation(
+        self,
+        chat_id: Union[str, int],
+        message_id: int,
+        tenant_id: str = "default",
+        account_id: str = "default",
+        session_id: str = "default"
+    ) -> int:
+        key = self._scope_key(chat_id, message_id, tenant_id, account_id, session_id)
+        return self._seek_generations.get(key, 0)
+
+    def advance_seek_generation(
+        self,
+        chat_id: Union[str, int],
+        message_id: int,
+        new_offset: int,
+        chunk_size: int = 512 * 1024,
+        tenant_id: str = "default",
+        account_id: str = "default",
+        session_id: str = "default"
+    ) -> int:
         norm_cid = StreamSlidingBuffer._canonical_cid(chat_id)
-        key = (norm_cid, int(message_id))
+        key = self._scope_key(chat_id, message_id, tenant_id, account_id, session_id)
         prev_gen = self._seek_generations.get(key, 0)
         gen = prev_gen + 1
         self._seek_generations[key] = gen
         self.seek_episode_manager.observe(norm_cid, int(message_id), new_offset, chunk_size)
 
-        # Invalidate old generation stop events
+        # Invalidate old generation stop events for THIS scoped session
         if prev_gen > 0:
-            old_gen_ev = self._generation_stop_events.pop((norm_cid, int(message_id), prev_gen), None)
+            old_gen_ev = self._generation_stop_events.pop((key, prev_gen), None)
             if old_gen_ev:
                 old_gen_ev.set()
 
-        # SFASE v1.0: Invalidate and cancel obsolete in-flight chunk tasks from superseded generations
+        # Invalidate and safely cancel obsolete in-flight chunk tasks from superseded generations in THIS session
         for ckey, task in list(self._chunk_task_registry.items()):
-            if ckey[0] == norm_cid and ckey[1] == int(message_id):
+            # ckey: (norm_cid, int(message_id), c_offset, session_id) or (norm_cid, int(message_id), c_offset)
+            if (
+                len(ckey) >= 3
+                and ckey[0] == norm_cid
+                and ckey[1] == int(message_id)
+                and (len(ckey) < 4 or ckey[3] == str(session_id))
+            ):
                 if getattr(task, "generation", 0) < gen and not task.completed:
-                    c_offset = ckey[2] if len(ckey) > 2 else 0
+                    c_offset = ckey[2]
                     if not stream_buffer.is_chunk_retained(norm_cid, int(message_id), c_offset):
                         if task.wire_task and not task.wire_task.done():
                             task.wire_task.cancel()
+                            self._retained_cleanup_tasks.add(task.wire_task)
+                            task.wire_task.add_done_callback(lambda t: self._retained_cleanup_tasks.discard(t))
                         if not task.future.done():
                             task.future.cancel()
 
@@ -212,9 +304,14 @@ class StreamEngine:
         get_fresh_message_fn: Optional[Any] = None,
         external_stop_event: Optional[asyncio.Event] = None,
         request_id: Optional[str] = None,
-        seek_generation: Optional[int] = None
+        seek_generation: Optional[int] = None,
+        tenant_id: str = "default",
+        account_id: str = "default",
+        session_id: str = "default",
+        t_admission: Optional[float] = None
     ) -> AsyncGenerator[bytes, None]:
         t0 = time.time()
+        t_admission = t_admission or time.monotonic()
         bytes_sent = 0
         first_chunk_sent = False
         effective_start = start
@@ -222,14 +319,19 @@ class StreamEngine:
         orig_mid = int(message_id)
         norm_cid = orig_cid
         media_key = (norm_cid, orig_mid)
+        scope_key = self._scope_key(norm_cid, orig_mid, tenant_id, account_id, session_id)
         stream_wire_tasks = set()
 
         if seek_generation is None:
-            seek_generation = self.get_seek_generation(norm_cid, orig_mid)
+            seek_generation = self.get_seek_generation(
+                norm_cid, orig_mid, tenant_id=tenant_id, account_id=account_id, session_id=session_id
+            )
             if seek_generation == 0 and start > 0:
-                seek_generation = self.advance_seek_generation(norm_cid, orig_mid, start)
+                seek_generation = self.advance_seek_generation(
+                    norm_cid, orig_mid, start, tenant_id=tenant_id, account_id=account_id, session_id=session_id
+                )
 
-        gen_stop_event = self._generation_stop_events.setdefault((norm_cid, orig_mid, seek_generation), asyncio.Event())
+        gen_stop_event = self._generation_stop_events.setdefault((scope_key, seek_generation), asyncio.Event())
 
         if not request_id:
             request_id = f"req_{uuid.uuid4().hex[:8]}"
@@ -384,18 +486,21 @@ class StreamEngine:
             access_hash = getattr(target_loc, "access_hash", None)
             file_ref = getattr(target_loc, "file_reference", None)
 
-            # SFASE v1.0: Urgent Seek Gate: seek head chunk bypasses rate pacing delays
+            # SFASE v1.1: Urgent Seek Gate: seek head chunk bypasses rate pacing delays with bounded reservation
             t_rate_start = time.monotonic()
             is_urgent_seek = is_head_chunk and is_media_player
             await rate_governor.acquire_chunk_slot(
                 target_size,
                 is_emergency=(is_emergency or is_urgent_seek),
                 is_unlimited=not is_media_player,
-                is_seek=is_urgent_seek
+                is_seek=is_urgent_seek,
+                client=worker_client
             )
             t_rate_ms = (time.monotonic() - t_rate_start) * 1000.0
             if task_obj:
                 task_obj.t_rate = t_rate_ms
+                if hasattr(task_obj, "metrics"):
+                    task_obj.metrics.t_rate_wait_ms = t_rate_ms
 
             if doc_id and access_hash and file_ref:
                 for rust_attempt in range(2):
@@ -423,6 +528,10 @@ class StreamEngine:
                                 if task_obj:
                                     task_obj.source = "Rust"
                                     task_obj.t_wire = t_wire_ms
+                                    if hasattr(task_obj, "metrics"):
+                                        task_obj.metrics.source = "Rust"
+                                        task_obj.metrics.t_rust_wire_ms = t_wire_ms
+                                        task_obj.metrics.t_wire_ms = t_wire_ms
                                 stream_buffer.push(norm_cid, message_id, target_offset, rust_data)
                                 if file_size > 0 and target_offset >= (file_size - 4 * 1024 * 1024):
                                     stream_buffer.push_tail(norm_cid, message_id, target_offset, rust_data)
@@ -457,6 +566,10 @@ class StreamEngine:
                                             if task_obj:
                                                 task_obj.source = "Rust"
                                                 task_obj.t_wire = t_wire_ms
+                                                if hasattr(task_obj, "metrics"):
+                                                    task_obj.metrics.source = "Rust"
+                                                    task_obj.metrics.t_rust_wire_ms = t_wire_ms
+                                                    task_obj.metrics.t_wire_ms = t_wire_ms
                                             stream_buffer.push(norm_cid, message_id, target_offset, rust_data)
                                             stream_cache_service.put_slice(norm_cid, message_id, target_offset, rust_data)
                                             if (orig_cid, orig_mid) != (norm_cid, message_id):
@@ -467,6 +580,9 @@ class StreamEngine:
                                             return rust_data
                         break
                     except Exception as r_err:
+                        t_rust_fail_ms = (time.monotonic() - t_wire_start) * 1000.0
+                        if task_obj and hasattr(task_obj, "metrics"):
+                            task_obj.metrics.t_fallback_ms = t_rust_fail_ms
                         err_s = str(r_err)
                         if "FILE_REFERENCE_EXPIRED" in err_s and rust_attempt == 0:
                             logger.info(f"STREAM [{clean_name}] Rust reported FILE_REFERENCE_EXPIRED for chunk at {target_offset:,}. Refreshing...")
@@ -515,18 +631,20 @@ class StreamEngine:
                     raise asyncio.CancelledError("Stream aborted by seek")
                 try:
                     c_t0 = time.time()
-                    t_wire_start = time.monotonic()
+                    t_lease_start = time.monotonic()
                     if (stop_event.is_set() or gen_stop_event.is_set()) and not is_head_chunk and not stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset):
                         raise asyncio.CancelledError("Stream aborted by seek")
                     chunk_timeout = 10.0 if is_head_chunk else (16.0 if is_media_player else 25.0)
                     async with self._get_mtproto_sem():
                         async with sender_pool.borrow(worker_client, dc_id, priority=(is_media_player or is_emergency or is_head_chunk)) as s:
+                            t_lease_ms = (time.monotonic() - t_lease_start) * 1000.0
+                            t_wire_start = time.monotonic()
                             res = await asyncio.wait_for(
                                 worker_client._call(s, req, flood_sleep_threshold=0),
                                 timeout=chunk_timeout
                             )
+                            t_wire_ms = (time.monotonic() - t_wire_start) * 1000.0
                     c_dt = max(0.001, time.time() - c_t0)
-                    t_wire_ms = (time.monotonic() - t_wire_start) * 1000.0
                     if hasattr(res, "bytes"):
                         data = res.bytes
                     elif isinstance(res, (bytes, bytearray)):
@@ -537,6 +655,11 @@ class StreamEngine:
                     if task_obj:
                         task_obj.source = "PyTelethon"
                         task_obj.t_wire = t_wire_ms
+                        if hasattr(task_obj, "metrics"):
+                            task_obj.metrics.source = "PyTelethon"
+                            task_obj.metrics.t_lease_wait_ms = t_lease_ms
+                            task_obj.metrics.t_py_wire_ms = t_wire_ms
+                            task_obj.metrics.t_wire_ms = t_wire_ms
 
                     stream_buffer.push(norm_cid, message_id, target_offset, data)
                     stream_cache_service.put_slice(norm_cid, message_id, target_offset, data)
@@ -683,7 +806,7 @@ class StreamEngine:
                 cached_data = stream_buffer.get_slice(orig_cid, orig_mid, c_offset, chunk_size)
             if cached_data and len(cached_data) == chunk_size:
                 logger.info(f"STREAM [{clean_name}] Chunk {c_idx+1}/{total_chunks} at {c_offset:,}: RAM buffer hit (0ms)")
-                return c_idx, cached_data
+                return c_idx, cached_data, ChunkTimingMetrics(t_admission=t_admission, source="RAM")
             disk_data = stream_cache_service.get_slice(norm_cid, message_id, c_offset, chunk_size)
             if not disk_data and (orig_cid, orig_mid) != (norm_cid, message_id):
                 disk_data = stream_cache_service.get_slice(orig_cid, orig_mid, c_offset, chunk_size)
@@ -692,14 +815,15 @@ class StreamEngine:
                 if (orig_cid, orig_mid) != (norm_cid, message_id):
                     stream_buffer.push(orig_cid, orig_mid, c_offset, disk_data)
                 logger.info(f"STREAM [{clean_name}] Chunk {c_idx+1}/{total_chunks} at {c_offset:,}: Disk buffer hit (0ms)")
-                return c_idx, disk_data
+                return c_idx, disk_data, ChunkTimingMetrics(t_admission=t_admission, source="Disk")
 
-            chunk_key = (norm_cid, int(message_id), c_offset)
+            chunk_key = (norm_cid, int(message_id), c_offset, str(session_id))
             lock = self._get_chunk_lock()
             async with lock:
                 task_obj = self._chunk_task_registry.get(chunk_key)
                 if task_obj is None or task_obj.future.done():
-                    task_obj = ChunkTask(chunk_key, generation=seek_generation, is_urgent=(c_idx == 0))
+                    task_metrics = ChunkTimingMetrics(t_admission=t_admission, t_queue_start=time.monotonic())
+                    task_obj = ChunkTask(chunk_key, generation=seek_generation, is_urgent=(c_idx == 0), metrics=task_metrics)
                     task_obj.subscribers.add(request_id)
                     task_obj.priority = 0 if c_idx == 0 else (1 if is_emergency else 3)
                     self._chunk_task_registry[chunk_key] = task_obj
@@ -726,13 +850,13 @@ class StreamEngine:
                                 if not wire_fut.done():
                                     wire_fut.cancel()
                                 return
-                        task_obj.t_queue = (time.time() - task_obj.created_at) * 1000.0
+                        task_obj.metrics.t_queue_wait_ms = (time.monotonic() - task_obj.metrics.t_queue_start) * 1000.0
                         data = await _download_chunk_from_mtproto(
                             c_offset, chunk_size, worker_client, is_emergency, is_head_chunk=(c_idx == 0), task_obj=task_obj
                         )
                         task_obj.completed = True
                         if not wire_fut.done():
-                            wire_fut.set_result(data)
+                            wire_fut.set_result((data, task_obj.metrics))
                     except (asyncio.CancelledError, BaseException) as e:
                         if not wire_fut.done():
                             if isinstance(e, asyncio.CancelledError):
@@ -763,19 +887,26 @@ class StreamEngine:
 
             try:
                 if c_idx == 0:
-                    data = await asyncio.shield(wire_fut)
+                    res = await asyncio.shield(wire_fut)
                 else:
-                    data = await asyncio.wait_for(asyncio.shield(wire_fut) if is_lead else wire_fut, timeout=25.0)
-                return c_idx, data
+                    res = await asyncio.wait_for(asyncio.shield(wire_fut) if is_lead else wire_fut, timeout=25.0)
+                if isinstance(res, tuple) and len(res) == 2:
+                    data, metrics = res
+                else:
+                    data = res
+                    metrics = getattr(task_obj, "metrics", ChunkTimingMetrics(t_admission=t_admission))
+                return c_idx, data, metrics
             except asyncio.CancelledError:
                 task_obj.subscribers.discard(request_id)
                 if not task_obj.subscribers:
                     is_cand = self.seek_episode_manager.is_candidate_window(norm_cid, message_id, c_offset, chunk_size)
                     is_retained = stream_buffer.is_chunk_retained(norm_cid, message_id, c_offset)
-                    is_stale = (self.get_seek_generation(norm_cid, message_id) > getattr(task_obj, "generation", 0))
+                    is_stale = (self.get_seek_generation(norm_cid, message_id, tenant_id=tenant_id, account_id=account_id, session_id=session_id) > getattr(task_obj, "generation", 0))
                     if not is_retained and (is_stale or (time.time() - task_obj.created_at) > 1.0):
                         if task_obj.wire_task and not task_obj.wire_task.done():
                             task_obj.wire_task.cancel()
+                            self._retained_cleanup_tasks.add(task_obj.wire_task)
+                            task_obj.wire_task.add_done_callback(lambda t: self._retained_cleanup_tasks.discard(t))
                         if not wire_fut.done():
                             wire_fut.cancel()
                     else:
@@ -792,15 +923,15 @@ class StreamEngine:
                         raise
                 cached_data = stream_buffer.get_slice(norm_cid, message_id, c_offset, chunk_size)
                 if cached_data and len(cached_data) == chunk_size:
-                    return c_idx, cached_data
+                    return c_idx, cached_data, ChunkTimingMetrics(t_admission=t_admission, source="RAM")
                 disk_data = stream_cache_service.get_slice(norm_cid, message_id, c_offset, chunk_size)
                 if disk_data and len(disk_data) == chunk_size:
                     stream_buffer.push(norm_cid, message_id, c_offset, disk_data)
-                    return c_idx, disk_data
+                    return c_idx, disk_data, ChunkTimingMetrics(t_admission=t_admission, source="Disk")
                 data = await _download_chunk_from_mtproto(
                     c_offset, chunk_size, worker_client, is_emergency, is_head_chunk=(c_idx == 0)
                 )
-                return c_idx, data
+                return c_idx, data, ChunkTimingMetrics(t_admission=t_admission, source="PyTelethon")
 
         last_progress_log = time.time()
         last_interval_time = last_progress_log
@@ -879,14 +1010,14 @@ class StreamEngine:
 
                 try:
                     while next_to_deliver < total_chunks and not stop_event.is_set() and not gen_stop_event.is_set():
-                        # SFASE v1.0: Superseded generation check
-                        if self.get_seek_generation(norm_cid, orig_mid) > seek_generation:
+                        # SFASE v1.1: Scoped superseded generation check
+                        if self.get_seek_generation(norm_cid, orig_mid, tenant_id=tenant_id, account_id=account_id, session_id=session_id) > seek_generation:
                             logger.debug(f"STREAM [{clean_name}] Pipelined producer superseded (gen {seek_generation} < active)")
                             break
 
                         while next_to_deliver in buffered and not stop_event.is_set():
-                            data = buffered.pop(next_to_deliver)
-                            if not await _put_chunk(data):
+                            chunk_item = buffered.pop(next_to_deliver)
+                            if not await _put_chunk(chunk_item):
                                 break
                             next_to_deliver += 1
 
@@ -896,7 +1027,7 @@ class StreamEngine:
                         runway = queue.qsize() + len(buffered)
                         if is_media_player:
                             if next_to_deliver == 0:
-                                # SFASE v1.0: Urgent Seek Gate: exactly 1 chunk in flight until seek target arrives!
+                                # SFASE v1.1: Urgent Seek Gate: exactly 1 chunk in flight until seek target arrives!
                                 allowed_in_flight = 1
                             elif next_to_deliver <= 2:
                                 allowed_in_flight = 2
@@ -922,7 +1053,7 @@ class StreamEngine:
                             and next_to_fetch < total_chunks
                             and not stop_event.is_set()
                             and not gen_stop_event.is_set()
-                            and self.get_seek_generation(norm_cid, orig_mid) <= seek_generation
+                            and self.get_seek_generation(norm_cid, orig_mid, tenant_id=tenant_id, account_id=account_id, session_id=session_id) <= seek_generation
                         ):
                             healthy_clients = [c for c in active_clients if not rate_governor.is_client_cooling_down(c)]
                             if not healthy_clients:
@@ -969,8 +1100,8 @@ class StreamEngine:
                                     res = d.result()
                                     if res is None:
                                         raise RuntimeError(f"fetch_one_chunk({c_idx}) returned None")
-                                    _, data = res
-                                    buffered[c_idx] = data
+                                    _, data, metrics = res
+                                    buffered[c_idx] = (data, metrics)
                                     wire_bytes_window += len(data)
                                     now_w = time.time()
                                     w_elapsed = now_w - last_wire_calc_time
@@ -986,7 +1117,7 @@ class StreamEngine:
                                     if not cached_data or len(cached_data) != chunk_size:
                                         cached_data = stream_cache_service.get_slice(norm_cid, message_id, aligned_offset + (c_idx * chunk_size), chunk_size)
                                     if cached_data and len(cached_data) == chunk_size:
-                                        buffered[c_idx] = cached_data
+                                        buffered[c_idx] = (cached_data, ChunkTimingMetrics(t_admission=t_admission, source="RAM"))
                                         continue
                                     chunk_retries[c_idx] += 1
                                     if chunk_retries[c_idx] >= 6:
@@ -1057,27 +1188,30 @@ class StreamEngine:
         try:
             feed_pos = aligned_offset
             while bytes_sent < length:
-                chunk = await queue.get()
-                if isinstance(chunk, Exception):
-                    raise chunk
-                if chunk is None:
+                queue_item = await queue.get()
+                if isinstance(queue_item, Exception):
+                    raise queue_item
+                if queue_item is None:
                     if bytes_sent < length:
                         logger.debug(f"STREAM [{clean_name}] Pipeline stopped early: sent {bytes_sent:,}/{length:,} bytes")
                         raise ConnectionResetError(f"Stream aborted before full length: sent {bytes_sent}/{length} bytes")
                     break
 
+                if isinstance(queue_item, tuple) and len(queue_item) == 2:
+                    chunk, metrics = queue_item
+                else:
+                    chunk = queue_item
+                    metrics = ChunkTimingMetrics(t_admission=t_admission)
+
                 if not first_chunk_sent:
                     first_chunk_sent = True
-                    ttfb = time.time() - t0
-                    # SFASE v1.0: Extract detailed timing diagnostics
-                    head_task = self._chunk_task_registry.get((norm_cid, int(orig_mid), aligned_offset))
-                    q_wait = getattr(head_task, "t_queue", 0.0) if head_task else 0.0
-                    rate_wait = getattr(head_task, "t_rate", 0.0) if head_task else 0.0
-                    wire_dur = getattr(head_task, "t_wire", 0.0) if head_task else 0.0
-                    src_tag = getattr(head_task, "source", "wire") if head_task else "wire"
+                    t_first_yield_ms = (time.monotonic() - t_admission) * 1000.0
+                    metrics.t_first_yield_ms = t_first_yield_ms
                     logger.info(
-                        f"STREAM [{clean_name}] Seek target chunk 1/{total_chunks} ({len(chunk):,}B) delivered in {ttfb:.3f}s (TTFB) "
-                        f"[queue={q_wait:.1f}ms, rate={rate_wait:.1f}ms, wire={wire_dur:.1f}ms, src={src_tag}, gen={seek_generation}]"
+                        f"STREAM [{clean_name}] Seek target chunk 1/{total_chunks} ({len(chunk):,}B) delivered in {t_first_yield_ms/1000.0:.3f}s (TTFB) "
+                        f"[queue={metrics.t_queue_wait_ms:.1f}ms, rate={metrics.t_rate_wait_ms:.1f}ms, lease={metrics.t_lease_wait_ms:.1f}ms, "
+                        f"wire={metrics.t_wire_ms:.1f}ms (Rust={metrics.t_rust_wire_ms:.1f}ms/Py={metrics.t_py_wire_ms:.1f}ms), "
+                        f"fb={metrics.t_fallback_ms:.1f}ms, src={metrics.source}, gen={seek_generation}]"
                     )
 
                 feed_pos += len(chunk)

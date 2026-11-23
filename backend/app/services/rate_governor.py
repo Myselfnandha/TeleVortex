@@ -128,6 +128,16 @@ class RateGovernor:
     def current_rate_limit_mbs(self) -> float:
         return self._rate
 
+    def reset(self):
+        """Resets rate governor state, clearing cooldowns and refilling tokens to capacity."""
+        self._tokens = self._capacity
+        self._target_time = time.monotonic()
+        self._cooldown_until = 0.0
+        self._cooldown_until_mono = 0.0
+        self._cooldown_reason = ""
+        self._client_cooldowns.clear()
+        self._cooldown_event.set()
+
     def report_flood_wait(
         self,
         seconds: int,
@@ -221,17 +231,31 @@ class RateGovernor:
         except asyncio.CancelledError:
             pass
 
-    async def wait_if_cooling_down(self):
+    def client_cooldown_remaining(self, client: Any) -> int:
+        """Returns the number of cooldown seconds remaining for a specific client or global gate."""
+        if client is None:
+            return self.cooldown_seconds_remaining
+        cid = id(client)
+        until = self._client_cooldowns.get(cid, 0.0)
+        if until > 0:
+            rem = until - time.monotonic()
+            if rem > 0:
+                return max(0, int(rem))
+        return self.cooldown_seconds_remaining
+
+    async def wait_if_cooling_down(self, client: Any = None):
         """Workers call this before executing MTProto requests to pause cleanly if cooldown is active."""
-        while self.is_cooling_down:
-            if not self._cooldown_event.is_set():
-                rem = max(0.2, float(self.cooldown_seconds_remaining))
-                logger.debug(f"Worker waiting on RateGovernor gate ({rem:.1f}s remaining)...")
-                try:
-                    await asyncio.wait_for(self._cooldown_event.wait(), timeout=rem + 0.5)
-                except asyncio.TimeoutError:
-                    pass
-            else:
+        while self.is_client_cooling_down(client) if client else self.is_cooling_down:
+            rem = self.client_cooldown_remaining(client) if client else self.cooldown_seconds_remaining
+            rem = max(0.1, float(rem))
+            logger.debug(f"Worker waiting on RateGovernor gate ({rem:.1f}s remaining, client={id(client) if client else 'global'})...")
+            try:
+                await asyncio.wait_for(self._cooldown_event.wait(), timeout=rem)
+            except asyncio.TimeoutError:
+                pass
+            if client and not self.is_client_cooling_down(client):
+                break
+            if not client and not self.is_cooling_down:
                 break
         if not self.is_cooling_down and not self._cooldown_event.is_set():
             self._cooldown_event.set()
@@ -241,14 +265,20 @@ class RateGovernor:
         chunk_size_bytes: int = 1024 * 1024,
         is_emergency: bool = False,
         is_unlimited: bool = False,
-        is_seek: bool = False
+        is_seek: bool = False,
+        client: Any = None
     ):
-        if is_emergency or is_seek:
-            # SFASE v1.0: Urgent seek requests immediately bypass pacing delays
-            return
-
-        was_cooling = self.is_cooling_down
-        await self.wait_if_cooling_down()
+        """
+        Acquires a transmission slot.
+        - Mandatory Cooldown Enforcement: FloodWait cooldown is ALWAYS enforced before ANY request,
+          strictly including urgent seeks and emergency recovery requests.
+        - Bounded High-Priority Token Reservation: Urgent seeks draw from a bounded overdraft allowance
+          (-self._capacity), admitting legitimate seek keyframe chunks immediately (0ms delay) while
+          deducting tokens so rapid repeated seeks cannot exceed account-level rate limits.
+        """
+        # PRIORITY 1: Mandatory Cooldown Enforcement
+        was_cooling = self.is_client_cooling_down(client) if client else self.is_cooling_down
+        await self.wait_if_cooling_down(client=client)
         if was_cooling:
             await asyncio.sleep(random.uniform(0.10, 0.35))
 
@@ -272,7 +302,25 @@ class RateGovernor:
                 self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
                 self._target_time = now
 
-            if self._tokens >= tokens_needed:
+            if is_seek:
+                # Bounded high-priority reservation: allow deficit down to -self._capacity
+                # Legitimate seeks admit with 0ms delay, but deduct tokens to protect account ceiling
+                max_overdraft = -self._capacity
+                if (self._tokens - tokens_needed) >= max_overdraft:
+                    self._tokens -= tokens_needed
+                    delay = 0.0
+                else:
+                    # Overdraft exhausted by rapid repeated seeks; bound delay to protect MTProto limit
+                    self._tokens = max(-self._capacity - tokens_needed, self._tokens - tokens_needed)
+                    chunk_interval = tokens_needed / self._rate
+                    self._target_time = max(now, min(now + 0.5, (self._target_time if self._target_time > now else now) + chunk_interval))
+                    raw_delay = self._target_time - now
+                    delay = max(0.05, min(raw_delay, 0.5))
+            elif is_emergency:
+                # Emergency recovery chunk: bounded priority
+                self._tokens -= tokens_needed
+                delay = 0.0
+            elif self._tokens >= tokens_needed:
                 self._tokens -= tokens_needed
                 delay = 0.0
             else:

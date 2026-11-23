@@ -702,11 +702,28 @@ class StreamEngine:
                             req = GetFileRequest(target_loc, offset=target_offset, limit=target_size)
                             continue
 
-                    if hasattr(worker_client, "is_connected") and not worker_client.is_connected():
-                        try:
-                            await asyncio.wait_for(worker_client.connect(), timeout=5.0)
-                        except Exception as rec_err:
-                            logger.debug(f"Reconnection attempt: {rec_err}")
+                    from app.services.connection_recovery import (
+                        connection_recovery_manager,
+                        RecoveryScope,
+                        RecoveryReason,
+                        ConnectionState,
+                    )
+                    scope = RecoveryScope(
+                        tenant_id=str(tenant_id),
+                        account_id=str(account_id or getattr(getattr(worker_client, "session", None), "user_id", "default")),
+                        dc_id=dc_id,
+                        transport="telethon"
+                    )
+                    recovery_reason = RecoveryReason.TIMEOUT if isinstance(conn_err, asyncio.TimeoutError) else RecoveryReason.SOCKET_RESET
+                    rec_state = await connection_recovery_manager.recover_connection(
+                        scope=scope,
+                        reason=recovery_reason,
+                        client=worker_client,
+                    )
+                    if rec_state == ConnectionState.AUTH_REQUIRED:
+                        raise RuntimeError(f"Telegram session revoked on DC {dc_id}")
+                    if rec_state == ConnectionState.COOLDOWN:
+                        continue
 
                     backoff = min(2.0, 0.2 * (1.5 ** attempt))
                     await asyncio.sleep(backoff)

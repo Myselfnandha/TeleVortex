@@ -169,6 +169,12 @@ class NetworkMonitor:
                 logger.debug(f"NetworkMonitor: Sender pool purge notice: {pe}")
 
             try:
+                from app.services.connection_recovery import connection_recovery_manager
+                await connection_recovery_manager.notify_network_changed(False, reason="carrier_down")
+            except Exception:
+                pass
+
+            try:
                 from app.services.rust_bridge import rust_bridge
                 rust_bridge.trip_circuit(15.0)
             except Exception:
@@ -192,6 +198,11 @@ class NetworkMonitor:
                 f"NetworkMonitor: Network interface reconnected (LAN IP: {lan_ip}). "
                 f"Reconnecting Telegram MTProto and resuming transfers."
             )
+            try:
+                from app.services.connection_recovery import connection_recovery_manager
+                await connection_recovery_manager.notify_network_changed(True, reason="reconnected")
+            except Exception:
+                pass
             try:
                 await TelegramClientManager.ensure_connected(timeout=10.0)
             except Exception as ce:

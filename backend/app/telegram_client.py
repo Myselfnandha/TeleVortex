@@ -593,14 +593,42 @@ class TelegramClientManager:
     async def ensure_connected(cls, timeout: float = 15.0) -> bool:
         if cls._client is not None and cls._client.is_connected():
             return True
-        if cls._client is not None:
-            try:
-                await asyncio.wait_for(cls._client.connect(), timeout=min(5.0, timeout))
-                if cls._client.is_connected():
-                    return True
-            except Exception:
-                pass
-        return await cls.reconnect_primary(timeout=timeout)
+
+        from app.services.connection_recovery import (
+            connection_recovery_manager,
+            RecoveryScope,
+            RecoveryReason,
+            ConnectionState,
+        )
+
+        dc = 5
+        if cls._client and hasattr(cls._client, "session") and hasattr(cls._client.session, "dc_id"):
+            dc = cls._client.session.dc_id or 5
+
+        scope = RecoveryScope(
+            tenant_id="default",
+            account_id="primary",
+            dc_id=dc,
+            transport="telethon"
+        )
+
+        async def _do_reconnect() -> bool:
+            if cls._client is not None:
+                try:
+                    await asyncio.wait_for(cls._client.connect(), timeout=min(5.0, timeout))
+                    if cls._client.is_connected():
+                        return True
+                except Exception:
+                    pass
+            return await cls.reconnect_primary(timeout=timeout)
+
+        state = await connection_recovery_manager.recover_connection(
+            scope=scope,
+            reason=RecoveryReason.SOCKET_RESET,
+            client=cls._client,
+            on_reconnect_coro=_do_reconnect
+        )
+        return state == ConnectionState.CONNECTED
 
     @classmethod
     async def is_authorized(cls) -> bool:

@@ -152,7 +152,29 @@ class MultiTenantTelegramManager:
                         managed.last_accessed_at = time.time()
                         return managed.client
                     else:
-                        # Stale connection in cache, discard and recreate
+                        # Attempt single-flight recovery via ACRM before discarding
+                        from app.services.connection_recovery import (
+                            connection_recovery_manager,
+                            RecoveryScope,
+                            RecoveryReason,
+                            ConnectionState
+                        )
+                        scope = RecoveryScope(
+                            tenant_id=str(principal.user_id),
+                            account_id=str(account.id),
+                            dc_id=getattr(managed.client.session, "dc_id", 5) or 5,
+                            transport="telethon"
+                        )
+                        st = await connection_recovery_manager.recover_connection(
+                            scope=scope,
+                            reason=RecoveryReason.SOCKET_RESET,
+                            client=managed.client,
+                            on_reconnect_coro=managed.client.connect
+                        )
+                        if st == ConnectionState.CONNECTED and managed.client.is_connected():
+                            managed.last_accessed_at = time.time()
+                            return managed.client
+                        # Stale connection in cache could not be recovered, discard and recreate
                         self._active_clients.pop(account.id, None)
 
             # Lazy initialization: load session string from encrypted vault

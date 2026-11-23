@@ -253,6 +253,17 @@ class RustBridge:
                     f"(hash={session_hash}): {err_detail}. Disabling repeated registration retries."
                 )
                 self._invalid_session_hashes.add(session_hash)
+                try:
+                    from app.services.connection_recovery import connection_recovery_manager, RecoveryScope
+                    scope = RecoveryScope(
+                        tenant_id="default",
+                        account_id=f"acc_{account_idx}",
+                        dc_id=5,
+                        transport="rust"
+                    )
+                    connection_recovery_manager.quarantine_session(scope, reason="Rust registration HTTP 400 format mismatch")
+                except Exception:
+                    pass
                 return False
             else:
                 logger.warning(f"Rust core rejected session registration (status {resp.status_code}): {resp.text}")

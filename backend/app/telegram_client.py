@@ -1626,6 +1626,12 @@ class MTProtoSenderPool:
                     bulk_sem.release()
                 except ValueError:
                     pass
+            if sender is not None and sender != getattr(client, "_sender", None):
+                # SFASE v1.1: Ensure freshly created or borrowed sender is safely disconnected if acquire is cancelled
+                try:
+                    asyncio.create_task(sender.disconnect())
+                except Exception:
+                    pass
             raise
         sender = None
         self._ensure_keepalive(client)
@@ -1743,6 +1749,12 @@ class MTProtoSenderPool:
                 try:
                     bulk_sem.release()
                 except ValueError:
+                    pass
+            if sender is not None and sender != getattr(client, "_sender", None):
+                # SFASE v1.1: Ensure freshly created or borrowed sender is safely disconnected if acquire is cancelled
+                try:
+                    asyncio.create_task(sender.disconnect())
+                except Exception:
                     pass
             raise
 

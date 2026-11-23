@@ -225,6 +225,14 @@ class RustBridge:
     async def register_session(self, session_string: str, api_id: int, account_idx: Optional[int] = None) -> bool:
         if not session_string or not api_id:
             return False
+        import hashlib
+        session_hash = hashlib.sha256(session_string.encode("utf-8")).hexdigest()[:16]
+        if not hasattr(self, "_invalid_session_hashes"):
+            self._invalid_session_hashes = set()
+        if session_hash in self._invalid_session_hashes:
+            logger.debug(f"Skipping registration for session {session_hash} on account {account_idx} (marked invalid/incompatible)")
+            return False
+
         try:
             client = self._get_client()
             payload = {"session_string": session_string.strip(), "api_id": int(api_id)}
@@ -237,6 +245,14 @@ class RustBridge:
             )
             if resp.status_code == 200:
                 return resp.json().get("success", False)
+            elif resp.status_code == 400:
+                err_detail = resp.text
+                logger.warning(
+                    f"Rust session registration rejected with HTTP 400 on account {account_idx} "
+                    f"(hash={session_hash}): {err_detail}. Disabling repeated registration retries."
+                )
+                self._invalid_session_hashes.add(session_hash)
+                return False
             else:
                 logger.warning(f"Rust core rejected session registration (status {resp.status_code}): {resp.text}")
         except Exception as e:
@@ -346,6 +362,10 @@ class RustBridge:
                 return data
             self.chunks_failed += 1
             err_text = resp.text
+            if "SESSION_REVOKED" in err_text or "AUTH_KEY_UNREGISTERED" in err_text or resp.status_code == 401:
+                logger.warning(f"Rust core session revoked/unregistered on account {account_idx}. Tripping circuit for 60s.")
+                self.trip_circuit(60.0)
+                return None
             if "FLOOD" in err_text or resp.status_code == 429:
                 import re
                 m = re.search(r"Some\((\d+)\)", err_text) or re.search(r"FLOOD.*?(\d+)", err_text)

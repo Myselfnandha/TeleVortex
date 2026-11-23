@@ -76,6 +76,17 @@ class StreamIteratorHandle:
         self.stop_event.set()
         if self.task and not self.task.done():
             self.task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self.task), timeout=1.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
+
+async def _safe_drain_task(t: asyncio.Task):
+    try:
+        await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+        pass
 
 
 def parse_http_range(range_header: str, file_size: int) -> Tuple[int, int, int, Optional[Response]]:
@@ -290,6 +301,8 @@ async def handle_proxy_download(
 ):
     if filename == "thumb":
         return await get_media_thumbnail(chat_id, message_id)
+
+    t_admission = time.monotonic()
 
     """
     Streaming proxy endpoint that fetches data dynamically from Telegram MTProto
@@ -641,21 +654,18 @@ async def handle_proxy_download(
         _ACTIVE_PREFETCH_TASKS[media_key] = pt
         pt.add_done_callback(lambda _t: _ACTIVE_PREFETCH_TASKS.pop(media_key, None) if _ACTIVE_PREFETCH_TASKS.get(media_key) is _t else None)
 
-    req_client_host = getattr(getattr(request, "client", None), "host", "127.0.0.1") or "127.0.0.1"
-    norm_client_host = "127.0.0.1" if req_client_host in ("::1", "localhost", "testclient", "testserver") else req_client_host
-    ua_lower = user_agent.lower() if user_agent else ""
-    if "vlc" in ua_lower:
-        client_tag = "vlc"
-    elif "mpv" in ua_lower:
-        client_tag = "mpv"
-    elif any(b in ua_lower for b in ["mozilla", "chrome", "safari", "webkit", "edge"]):
-        client_tag = "browser"
-    else:
-        client_tag = "generic"
+    tenant_id = str(tenant_user_id or "default")
+    account_id = str(getattr(grant, "account_id", None) or "default")
+    playback_session_id = request.headers.get("X-Playback-Session-Id") or request.cookies.get("tg_playback_session")
+    if not playback_session_id:
+        req_client_host = getattr(getattr(request, "client", None), "host", "127.0.0.1") or "127.0.0.1"
+        norm_client_host = "127.0.0.1" if req_client_host in ("::1", "localhost", "testclient", "testserver") else req_client_host
+        ua_fingerprint = hashlib.sha256(f"{user_agent}_{norm_client_host}_{tenant_id}".encode("utf-8")).hexdigest()[:16]
+        playback_session_id = f"sess_{ua_fingerprint}"
 
     req_id = f"req_{uuid.uuid4().hex[:8]}"
     curr_task = asyncio.current_task()
-    session_key = (norm_chat_id, message_id, client_tag, norm_client_host, req_id)
+    session_key = (tenant_id, account_id, norm_chat_id, message_id, playback_session_id, req_id)
 
     stop_event = asyncio.Event()
     handle = StreamIteratorHandle(
@@ -668,30 +678,34 @@ async def handle_proxy_download(
     )
 
     if curr_task and is_media_player and is_playback_stream:
-        # RC-001: Only cancel genuinely superseded PLAYBACK streams.
-        # Concurrent metadata probes (head elements, tail cues) must coexist independently.
+        # RC-001: Only cancel genuinely superseded PLAYBACK streams within this tenant/account/session.
+        # Concurrent metadata probes and independent players must coexist independently.
         for sk, old_h in list(_ACTIVE_STREAM_ITERS.items()):
             if (
-                len(sk) >= 5
-                and sk[0] == norm_chat_id
-                and sk[1] == message_id
-                and sk[2] == client_tag
-                and sk[3] == norm_client_host
-                and sk[4] != req_id
+                len(sk) >= 6
+                and sk[0] == tenant_id
+                and sk[1] == account_id
+                and sk[2] == norm_chat_id
+                and sk[3] == message_id
+                and sk[4] == playback_session_id
+                and sk[5] != req_id
             ):
                 if getattr(old_h, "is_playback_stream", False) and getattr(old_h, "start", 0) != start:
                     logger.info(
                         f"STREAM [{clean_name}] Cancelling superseded playback stream at offset {getattr(old_h, 'start', 0):,} "
-                        f"(superseded by seek to {start:,}, req={req_id})"
+                        f"(superseded by seek to {start:,}, tenant={tenant_id}, session={playback_session_id}, req={req_id})"
                     )
                     _ACTIVE_STREAM_ITERS.pop(sk, None)
                     old_h.stop_event.set()
                     if old_h.task and not old_h.task.done():
                         old_h.task.cancel()
+                        asyncio.create_task(_safe_drain_task(old_h.task))
                     _ACTIVE_STREAM_TASKS.pop(sk, None)
-                    stream_engine.advance_seek_generation(norm_chat_id, message_id, start)
         if start > 0:
-            stream_engine.advance_seek_generation(norm_chat_id, message_id, start)
+            stream_engine.advance_seek_generation(
+                norm_chat_id, message_id, start,
+                tenant_id=tenant_id, account_id=account_id, session_id=playback_session_id
+            )
 
     if is_playback_stream:
         pref_t = _ACTIVE_PREFETCH_TASKS.pop(media_key, None)
@@ -736,7 +750,11 @@ async def handle_proxy_download(
                 message=message,
                 get_fresh_message_fn=get_streamable_message,
                 external_stop_event=stop_event,
-                request_id=req_id
+                request_id=req_id,
+                tenant_id=tenant_id,
+                account_id=account_id,
+                session_id=playback_session_id,
+                t_admission=t_admission
             )
         handle.it = gen
 
@@ -796,6 +814,8 @@ async def handle_transmux_stream(
 ):
     if filename == "thumb":
         return await get_media_thumbnail(chat_id, message_id)
+
+    t_admission = time.monotonic()
 
     """
     Real-Time Zero-Disk FFmpeg Chunk-Based Transmuxing Stream with Local Cache Acceleration.

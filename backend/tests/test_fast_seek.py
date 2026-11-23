@@ -11,6 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.services.fast_stream_engine import FastStreamEngine, MediaStreamSession, SLICE_SIZE, MAX_MEM_CACHE_PER_MEDIA
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_governor():
+    from app.services.rate_governor import rate_governor
+    rate_governor.reset()
+    yield
+    rate_governor.reset()
+
+
 def test_session_slice_range_and_availability():
     """Validates 1MB slice calculation and presence in memory."""
     session = MediaStreamSession("chat123", 100, 100 * 1024 * 1024, "video.mp4")
@@ -888,7 +896,7 @@ async def test_download_media_subtitles_endpoint(tmp_path):
     from telethon.tl.types import MessageMediaDocument, Document
 
     # 1. Test fallback blank subtitle when no cached file exists
-    with patch.object(subtitle_service, "get_or_download_subtitle", new_callable=AsyncMock, return_value=None):
+    with patch("app.services.subtitle_service.subtitle_service.get_or_download_subtitle", AsyncMock(return_value=None)):
         res = await download_media_subtitles("chat_sub", 1001)
         assert res.status_code == 200
         assert res.media_type == "text/plain; charset=utf-8"
@@ -1373,7 +1381,7 @@ async def test_stream_engine_abort_message_stream_cancels_all_lookahead_tasks():
         engine.abort_message_stream(chat_id, msg_id)
 
         # Confirm all wire tasks were cancelled
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05)
         assert media_key not in engine._active_stream_wire_tasks
         assert cancelled_wire_calls > 0
 

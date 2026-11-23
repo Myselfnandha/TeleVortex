@@ -42,8 +42,27 @@ pub fn decode_telethon_string_session(raw: &str) -> Result<TelethonSessionInfo, 
             ipv4: SocketAddrV4::new(ip, port),
             auth_key,
         })
+    } else if bytes.len() == 275 {
+        let dc_id = bytes[0] as i32;
+        let port = u16::from_be_bytes([bytes[17], bytes[18]]);
+        let mut auth_key = [0u8; 256];
+        auth_key.copy_from_slice(&bytes[19..275]);
+
+        let fallback_ip = match dc_id {
+            1 => Ipv4Addr::new(149, 154, 175, 53),
+            2 => Ipv4Addr::new(149, 154, 167, 51),
+            3 => Ipv4Addr::new(149, 154, 175, 100),
+            4 => Ipv4Addr::new(149, 154, 167, 91),
+            _ => Ipv4Addr::new(91, 108, 56, 130),
+        };
+
+        Ok(TelethonSessionInfo {
+            dc_id,
+            ipv4: SocketAddrV4::new(fallback_ip, port),
+            auth_key,
+        })
     } else {
-        Err(format!("Unexpected session byte length: {}", bytes.len()))
+        Err(format!("Unexpected session byte length: {} (expected 263 or 275)", bytes.len()))
     }
 }
 
@@ -86,6 +105,13 @@ pub async fn create_client_from_string(
         (4, Ipv4Addr::new(149, 154, 167, 91), 443),
         (5, Ipv4Addr::new(91, 108, 56, 130), 443),
     ];
+    let home_auth = session
+        .dc_option(info.dc_id)
+        .ok()
+        .flatten()
+        .and_then(|opt| opt.auth_key);
+    let session_reauthenticated = home_auth.map(|k| k != info.auth_key).unwrap_or(false);
+
     for (id, ip, port) in default_dcs {
         let existing_auth = session
             .dc_option(id)
@@ -94,6 +120,8 @@ pub async fn create_client_from_string(
             .and_then(|opt| opt.auth_key);
         let auth_key = if id == info.dc_id {
             Some(info.auth_key)
+        } else if session_reauthenticated {
+            None
         } else {
             existing_auth
         };

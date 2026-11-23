@@ -411,6 +411,7 @@ async def test_check5_media_ttfb_and_seek_benchmarks(monkeypatch):
         yield MagicMock()
 
     monkeypatch.setattr("app.services.stream_engine.sender_pool.borrow", fake_borrow)
+    monkeypatch.setattr("app.telegram_client.TelegramClientManager.get_active_streaming_clients", AsyncMock(return_value=[fake_client]))
 
     total_file_size = 100 * 1024 * 1024  # 100 MB media file
     seek_latencies_ms = []

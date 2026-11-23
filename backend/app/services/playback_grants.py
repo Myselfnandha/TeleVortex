@@ -10,13 +10,13 @@ import logging
 from typing import Optional, Dict, Any, List, Union, Set
 from dataclasses import dataclass, asdict
 
-from app.config import API_HASH
+from app.services.vlc_playback import _get_signing_secret
 
 logger = logging.getLogger("playback_grants")
 
-# Use master key or API_HASH for cryptographic signing
-_RAW_KEY = os.getenv("SESSION_MASTER_KEY_B64", "") or os.getenv("SESSION_VAULT_MASTER_KEY", "") or API_HASH or "tg_power_suite_playback_master_secret"
-SIGNING_KEY = hashlib.sha256(_RAW_KEY.encode("utf-8")).digest()
+# Use dedicated playback signing secret or session vault master key
+_RAW_KEY = os.getenv("PLAYBACK_SIGNING_SECRET", "") or os.getenv("SESSION_MASTER_KEY_B64", "") or os.getenv("SESSION_VAULT_MASTER_KEY", "")
+SIGNING_KEY = hashlib.sha256(_RAW_KEY.encode("utf-8")).digest() if _RAW_KEY else _get_signing_secret()
 
 
 @dataclass

@@ -53,6 +53,56 @@ def test_grant_expires():
     assert not store.allows(token, "-100123", 42)
 
 
+def test_grant_individual_revocation():
+    store = PlaybackGrantStore(ttl_seconds=3600)
+    token = store.issue("-100123", 42)
+    assert store.allows(token, "-100123", 42) is True
+    assert store.revoke(token) is True
+    assert store.allows(token, "-100123", 42) is False
+
+
+def test_grant_media_revocation():
+    store = PlaybackGrantStore(ttl_seconds=3600)
+    token1 = store.issue("-100123", 42)
+    token2 = store.issue("-100123", 42)
+    token_other = store.issue("-100123", 99)
+    assert store.allows(token1, "-100123", 42) is True
+    assert store.allows(token2, "-100123", 42) is True
+    assert store.allows(token_other, "-100123", 99) is True
+
+    revoked_count = store.revoke_media("-100123", 42)
+    assert revoked_count == 2
+    assert store.allows(token1, "-100123", 42) is False
+    assert store.allows(token2, "-100123", 42) is False
+    # Unrelated media grant remains valid
+    assert store.allows(token_other, "-100123", 99) is True
+
+
+def test_grant_elimination_of_static_signature_bypass():
+    import hmac, hashlib
+    store = PlaybackGrantStore(ttl_seconds=3600)
+    # Fabricate legacy static HMAC token: hmac(secret, norm_chat:message_id)
+    legacy_static_sig = hmac.new(store.secret, b"123:42", hashlib.sha256).hexdigest()
+    # In old code, this passed. In hardened code, this MUST be rejected!
+    assert store.allows(legacy_static_sig, "-100123", 42) is False
+
+
+def test_grant_stateless_post_restart_capability():
+    shared_secret = b"test_dedicated_secret_123456789012"
+    store1 = PlaybackGrantStore(ttl_seconds=3600, secret=shared_secret)
+    token = store1.issue("-100123", 42)
+    assert store1.allows(token, "-100123", 42) is True
+
+    # Simulate fresh server process after restart with empty memory
+    store2 = PlaybackGrantStore(ttl_seconds=3600, secret=shared_secret)
+    assert len(store2._grants) == 0
+    # Cryptographic capability token verifies successfully
+    assert store2.allows(token, "-100123", 42) is True
+    # But revoking it in store2 immediately blocks it
+    store2.revoke(token)
+    assert store2.allows(token, "-100123", 42) is False
+
+
 def test_remote_vlc_media_link_works_without_permanent_api_token(monkeypatch):
     monkeypatch.setattr(auth, "API_AUTH_TOKEN", "")
     monkeypatch.setattr(auth, "ENABLE_API_AUTH", True)

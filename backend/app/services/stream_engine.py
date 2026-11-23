@@ -1170,11 +1170,10 @@ class StreamEngine:
                                 t.cancel()
                     in_flight_clients.clear()
                     client_active_chunks.clear()
-                    if not stop_event.is_set():
-                        try:
-                            queue.put_nowait(None)
-                        except Exception:
-                            pass
+                    try:
+                        queue.put_nowait(None)
+                    except Exception:
+                        pass
 
             producer_task = asyncio.create_task(pipelined_chunk_producer())
 
@@ -1188,6 +1187,8 @@ class StreamEngine:
         try:
             feed_pos = aligned_offset
             while bytes_sent < length:
+                if (stop_event.is_set() or gen_stop_event.is_set()) and queue.empty():
+                    raise ConnectionResetError(f"Stream aborted by stop event: sent {bytes_sent}/{length} bytes")
                 queue_item = await queue.get()
                 if isinstance(queue_item, Exception):
                     raise queue_item
@@ -1318,7 +1319,7 @@ class StreamEngine:
             if producer_task and not producer_task.done():
                 producer_task.cancel()
                 try:
-                    await asyncio.wait_for(asyncio.shield(producer_task), timeout=2.0)
+                    await asyncio.wait_for(asyncio.shield(producer_task), timeout=0.1)
                 except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                     pass
                 if not producer_task.done():

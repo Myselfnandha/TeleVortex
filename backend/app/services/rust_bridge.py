@@ -95,19 +95,20 @@ class RustBridge:
         except RuntimeError:
             current_loop = None
 
-        if (
-            self._client is None
-            or self._client.is_closed
-            or getattr(self, "_client_loop", None) != current_loop
-        ):
-            headers = {"Authorization": f"Bearer {_RUST_CORE_AUTH_TOKEN}"}
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                headers=headers,
-                timeout=httpx.Timeout(45.0, connect=5.0),
-                limits=httpx.Limits(max_keepalive_connections=64, max_connections=128)
-            )
-            self._client_loop = current_loop
+        if self._client is not None and not getattr(self._client, "is_closed", False):
+            if getattr(self, "_client_loop", None) is None:
+                self._client_loop = current_loop
+            if self._client_loop == current_loop:
+                return self._client
+
+        headers = {"Authorization": f"Bearer {_RUST_CORE_AUTH_TOKEN}"}
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers=headers,
+            timeout=httpx.Timeout(45.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=64, max_connections=128)
+        )
+        self._client_loop = current_loop
         return self._client
 
     def find_binary(self) -> Optional[Path]:

@@ -50,6 +50,7 @@ backend/backups/
 backend/backup/
 *.key
 backend/data/.session_master_key
+backend/data/.playback_signing_secret
 backend/data/*.db
 *.db
 *.sqlite3

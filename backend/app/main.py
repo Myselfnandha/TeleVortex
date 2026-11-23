@@ -66,7 +66,7 @@ class SensitiveDataFilter(logging.Filter):
     Matches all query parameter variations and header patterns regardless of token length.
     """
     # Use atomic grouping (?>...) to prevent backtracking on long inputs
-    TOKEN_REGEX = re.compile(r'([?&](?:token|playback_token|apiKey|api_key|key|secret|auth|access_token)=)[^&\s"\']+', re.IGNORECASE)
+    TOKEN_REGEX = re.compile(r'([?&](?:token|playback_token|grant|apiKey|api_key|key|secret|auth|access_token)=)[^&\s"\']+', re.IGNORECASE)
     BEARER_REGEX = re.compile(r'(Bearer\s+)\S+', re.IGNORECASE)
     HEADER_REGEX = re.compile(r'((?:X-API-Key|Authorization)\s*[:=]\s*)[^\r\n,]+', re.IGNORECASE)
 
@@ -511,30 +511,42 @@ class GlobalAuthEnforcementMiddleware:
                     await response(scope, receive, send)
                     return
 
-            if is_loopback and not token and not enable_auth and method in ("GET", "HEAD") and path.startswith(("/dl/", "/stream/")):
+            query_str = str(req.url.query) if req.url else ""
+            has_grant_param = "playback_token=" in query_str or "grant=" in query_str
+
+            if not has_grant_param and is_loopback and not token and not enable_auth and method in ("GET", "HEAD") and path.startswith(("/dl/", "/stream/")):
                 await self.app(scope, receive, send)
                 return
 
-            must_auth = bool(token) or enable_auth or not is_loopback
+            must_auth = bool(token) or enable_auth or not is_loopback or has_grant_param
             if must_auth:
-                if not token:
-                    if is_authenticated(req):
-                        await self.app(scope, receive, send)
-                        return
-                    response = Response(
-                        content='{"detail":"Forbidden: Non-loopback or remote requests require API_AUTH_TOKEN to be configured on the server."}',
-                        status_code=403,
-                        media_type="application/json"
-                    )
-                    await response(scope, receive, send)
-                    return
                 if not is_authenticated(req):
+                    if has_grant_param:
+                        response = Response(
+                            content='{"detail":"Forbidden: Playback token is invalid, expired, or revoked."}',
+                            status_code=403,
+                            media_type="application/json"
+                        )
+                        await response(scope, receive, send)
+                        return
+                    if not token:
+                        response = Response(
+                            content='{"detail":"Forbidden: Non-loopback or remote requests require API_AUTH_TOKEN to be configured on the server."}',
+                            status_code=403,
+                            media_type="application/json"
+                        )
+                        await response(scope, receive, send)
+                        return
                     response = Response(
                         content='{"detail":"Unauthorized: Valid API authentication token required."}',
                         status_code=401,
                         media_type="application/json"
                     )
                     await response(scope, receive, send)
+                    return
+                elif has_grant_param:
+                    # Valid capability token for media access
+                    await self.app(scope, receive, send)
                     return
 
         await self.app(scope, receive, send)

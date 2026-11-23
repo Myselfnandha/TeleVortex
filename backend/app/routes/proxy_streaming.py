@@ -315,6 +315,23 @@ async def handle_proxy_download(
     grant = getattr(request.state, "grant", None)
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
 
+    # Defense-in-depth: enforce playback token validity even if middleware was bypassed
+    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    if grant_token:
+        is_token_valid = False
+        if grant is not None:
+            is_token_valid = True
+        else:
+            try:
+                from app.services.vlc_playback import playback_grants
+                is_token_valid = playback_grants.allows(
+                    grant_token, chat_id, message_id, tenant_id=tenant_user_id
+                )
+            except Exception:
+                is_token_valid = False
+        if not is_token_valid:
+            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
+
     try:
         if tenant_user_id:
             from app.telegram.client_manager import multi_tenant_manager
@@ -829,6 +846,23 @@ async def handle_transmux_stream(
     grant = getattr(request.state, "grant", None)
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
 
+    # Defense-in-depth: enforce playback token validity even if middleware was bypassed
+    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    if grant_token:
+        is_token_valid = False
+        if grant is not None:
+            is_token_valid = True
+        else:
+            try:
+                from app.services.vlc_playback import playback_grants
+                is_token_valid = playback_grants.allows(
+                    grant_token, chat_id, message_id, tenant_id=tenant_user_id
+                )
+            except Exception:
+                is_token_valid = False
+        if not is_token_valid:
+            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
+
     if tenant_user_id:
         from app.telegram.client_manager import multi_tenant_manager
         from app.auth_v3.session_service import Principal
@@ -1031,7 +1065,7 @@ async def handle_transmux_stream(
 
 
 @router.get("/api/media/streams/{chat_id}/{message_id}", dependencies=[Depends(verify_auth)])
-async def probe_media_streams(chat_id: str, message_id: int):
+async def probe_media_streams(chat_id: str, message_id: int, request: Request):
     """
     Probes audio languages, video codecs, and embedded subtitle tracks for the player toolbar.
     Cached in memory for instant responses.
@@ -1051,6 +1085,23 @@ async def probe_media_streams(chat_id: str, message_id: int):
     principal = getattr(request.state, "principal", None)
     grant = getattr(request.state, "grant", None)
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
+
+    # Defense-in-depth: enforce playback token validity even if middleware was bypassed
+    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    if grant_token:
+        is_token_valid = False
+        if grant is not None:
+            is_token_valid = True
+        else:
+            try:
+                from app.services.vlc_playback import playback_grants
+                is_token_valid = playback_grants.allows(
+                    grant_token, chat_id, message_id, tenant_id=tenant_user_id
+                )
+            except Exception:
+                is_token_valid = False
+        if not is_token_valid:
+            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
 
     if tenant_user_id:
         from app.telegram.client_manager import multi_tenant_manager

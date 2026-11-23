@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from unittest.mock import AsyncMock, MagicMock, patch
 from starlette.requests import Request
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -233,5 +234,81 @@ async def test_get_streamable_message_cross_client_resolution():
         res = await cinema_catalog.get_streamable_message(sec_client, -100999888, 555, force_refresh=True)
         assert res is sec_msg
         assert any(c.args == ("my_cool_channel",) for c in sec_client.get_entity.await_args_list)
+
+
+def test_grant_durable_revocation_persistence(tmp_path):
+    persistence_file = tmp_path / "revocations.json"
+    shared_secret = b"test_dedicated_secret_123456789012"
+    store1 = PlaybackGrantStore(ttl_seconds=3600, secret=shared_secret, persistence_file=persistence_file)
+
+    token1 = store1.issue("-100123", 42)
+    token2 = store1.issue("-100123", 43)
+
+    assert store1.allows(token1, "-100123", 42) is True
+    assert store1.allows(token2, "-100123", 43) is True
+
+    # Revoke token1
+    store1.revoke(token1)
+    assert store1.allows(token1, "-100123", 42) is False
+
+    # Simulate restart by creating fresh instance loading from persistence file
+    store2 = PlaybackGrantStore(ttl_seconds=3600, secret=shared_secret, persistence_file=persistence_file)
+    assert store2.allows(token1, "-100123", 42) is False  # Persisted revocation!
+    assert store2.allows(token2, "-100123", 43) is True   # Token 2 remains valid!
+
+
+def test_grant_tenant_isolation():
+    shared_secret = b"test_dedicated_secret_123456789012"
+    store = PlaybackGrantStore(ttl_seconds=3600, secret=shared_secret)
+
+    # Issue grant bound to tenant-A
+    token_tenant_a = store.issue("-100123", 42, tenant_id="tenant-A")
+
+    # Access by tenant-A succeeds
+    assert store.allows(token_tenant_a, "-100123", 42, tenant_id="tenant-A") is True
+
+    # Access by tenant-B fails
+    assert store.allows(token_tenant_a, "-100123", 42, tenant_id="tenant-B") is False
+
+
+def test_playback_secret_production_fail_closed(monkeypatch):
+    from app.services.vlc_playback import _get_signing_secret
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("PLAYBACK_SIGNING_SECRET", raising=False)
+
+    # In production without secret or existing persistent secret, must fail closed
+    with patch("app.config.DATA_DIR") as mock_dir:
+        mock_file = MagicMock()
+        mock_file.exists.return_value = False
+        mock_dir.__truediv__.return_value = mock_file
+
+        with pytest.raises(RuntimeError, match="CRITICAL: PLAYBACK_SIGNING_SECRET"):
+            _get_signing_secret()
+
+
+def test_loopback_rejects_invalid_and_revoked_tokens(monkeypatch):
+    monkeypatch.setattr(auth, "API_AUTH_TOKEN", "")
+    monkeypatch.setattr(auth, "ENABLE_API_AUTH", False)
+
+    # Loopback request with invalid token must fail with 403
+    loopback_req_invalid = _request("/dl/-100123/42/movie.mkv", "invalid_garbage_token", peer="127.0.0.1")
+    assert auth.is_authenticated(loopback_req_invalid) is False
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(auth.verify_auth(loopback_req_invalid))
+    assert exc_info.value.status_code == 403
+
+    # Valid token works on loopback
+    valid_token = playback_grants.issue("-100123", 42)
+    loopback_req_valid = _request("/dl/-100123/42/movie.mkv", valid_token, peer="127.0.0.1")
+    assert auth.is_authenticated(loopback_req_valid) is True
+    asyncio.run(auth.verify_auth(loopback_req_valid))
+
+    # Revoked token fails on loopback with 403
+    playback_grants.revoke(valid_token)
+    assert auth.is_authenticated(loopback_req_valid) is False
+    with pytest.raises(HTTPException) as exc_info2:
+        asyncio.run(auth.verify_auth(loopback_req_valid))
+    assert exc_info2.value.status_code == 403
 
 

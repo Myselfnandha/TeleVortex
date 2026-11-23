@@ -47,38 +47,51 @@ def is_authenticated(request: Request) -> bool:
     # short-lived capability only for GET/HEAD requests to one exact /dl/{chat}/{message}
     # resource. It cannot authorize API routes, transmux endpoints, or another media item.
     req_method = request.scope.get("method", "GET") if hasattr(request, "scope") else getattr(request, "method", "GET")
+    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token", "")
+
     if req_method in ("GET", "HEAD"):
         path = request.scope.get("path", "") if hasattr(request, "scope") else getattr(request, "path", "")
         parts = path.split("/")
-        if not token_to_check and not ENABLE_API_AUTH and is_loopback and path.startswith(("/dl/", "/stream/")):
-            return True
         media_identity = None
         if (path.startswith("/dl/") or path.startswith("/stream/")) and len(parts) >= 4 and parts[2] and parts[3].isdigit():
             media_identity = (parts[2], int(parts[3]))
         elif path.startswith("/api/media/subtitles/download/") and len(parts) >= 7 and parts[5] and parts[6].isdigit():
             media_identity = (parts[5], int(parts[6]))
-        if media_identity:
-            try:
-                from app.services.playback_grants import playback_grant_service
-                grant_token = request.query_params.get("grant") or request.query_params.get("playback_token", "")
-                if grant_token:
+
+        if grant_token:
+            # When an explicit grant token is supplied, it MUST be valid for this media identity.
+            # Never bypass validation on loopback if an invalid/revoked grant token was provided.
+            if media_identity:
+                tenant_id = None
+                if hasattr(request.state, "principal") and request.state.principal:
+                    tenant_id = request.state.principal.user_id
+                try:
+                    from app.services.playback_grants import playback_grant_service
                     grant = playback_grant_service.verify_grant(
                         grant_token, media_identity[0], media_identity[1]
                     )
                     if grant:
                         request.state.grant = grant
                         return True
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            try:
-                from app.services.vlc_playback import playback_grants
-                if playback_grants.allows(
-                    request.query_params.get("playback_token", ""), media_identity[0], media_identity[1]
-                ):
-                    return True
-            except Exception:
-                pass
+                try:
+                    from app.services.vlc_playback import playback_grants
+                    if playback_grants.allows(
+                        grant_token, media_identity[0], media_identity[1], tenant_id=tenant_id
+                    ):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        if not token_to_check and not ENABLE_API_AUTH and is_loopback and path.startswith(("/dl/", "/stream/")):
+            return True
+
+    if grant_token:
+        # A grant token was supplied but did not validate as a media capability
+        return False
 
     if not token_to_check and not ENABLE_API_AUTH and is_loopback:
         return True
@@ -151,14 +164,20 @@ async def verify_auth(request: Request):
         except Exception:
             pass
 
+    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token", "")
     is_loopback = is_loopback_request(request)
-    must_authenticate = bool(API_AUTH_TOKEN) or ENABLE_API_AUTH or not is_loopback
+    must_authenticate = bool(API_AUTH_TOKEN) or ENABLE_API_AUTH or not is_loopback or bool(grant_token)
 
     if must_authenticate:
         # A valid media-scoped playback capability is also an authentication credential
         # for its single media resource, including when the permanent API token is unset.
         if is_authenticated(request):
             return
+        if grant_token:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: Playback token is invalid, expired, or revoked."
+            )
         if not API_AUTH_TOKEN:
             # Non-loopback / remote access attempted without configured API_AUTH_TOKEN
             raise HTTPException(

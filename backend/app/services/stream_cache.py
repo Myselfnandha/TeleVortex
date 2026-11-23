@@ -170,7 +170,7 @@ class StreamCacheManager:
         prefix = f"tenant_{user_id}_" if user_id else ""
 
         for cid in candidate_cids:
-            full_path = self.get_cached_file(cid, message_id)
+            full_path = self.get_cached_file(cid, message_id, user_id=user_id)
             if full_path and full_path.exists() and full_path.is_file():
                 try:
                     file_size = full_path.stat().st_size

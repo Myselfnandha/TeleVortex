@@ -296,8 +296,9 @@ async def test_get_streamable_message_auto_heals_unknown_entity():
 
 
 @pytest.mark.asyncio
-async def test_direct_streamer_pipelined_producer_delivers_chunks():
+async def test_direct_streamer_pipelined_producer_delivers_chunks(monkeypatch):
     """Verifies that pipelined_chunk_producer correctly accesses file_loc in nested scope and yields chunks."""
+    monkeypatch.setenv("MULTI_TENANT_STREAMING_ENABLED", "false")
     import time
     from app.routes.proxy import handle_proxy_download, _STREAM_MESSAGE_CACHE
     from starlette.requests import Request

@@ -316,7 +316,11 @@ async def handle_proxy_download(
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
 
     # Defense-in-depth: enforce playback token validity even if middleware was bypassed
-    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    grant_token = None
+    try:
+        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    except Exception:
+        pass
     if grant_token:
         is_token_valid = False
         if grant is not None:
@@ -847,7 +851,11 @@ async def handle_transmux_stream(
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
 
     # Defense-in-depth: enforce playback token validity even if middleware was bypassed
-    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    grant_token = None
+    try:
+        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    except Exception:
+        pass
     if grant_token:
         is_token_valid = False
         if grant is not None:
@@ -1087,7 +1095,11 @@ async def probe_media_streams(chat_id: str, message_id: int, request: Request):
     tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
 
     # Defense-in-depth: enforce playback token validity even if middleware was bypassed
-    grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    grant_token = None
+    try:
+        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    except Exception:
+        pass
     if grant_token:
         is_token_valid = False
         if grant is not None:

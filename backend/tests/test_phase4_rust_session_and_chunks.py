@@ -4,6 +4,8 @@ from app.services.rust_bridge import rust_bridge, _RUST_CORE_AUTH_TOKEN
 
 @pytest.mark.asyncio
 async def test_rust_core_unauthorized_rejection():
+    if not await rust_bridge.is_healthy():
+        await rust_bridge.start_daemon()
     # Calling /api/* without Authorization header must return 401 Unauthorized
     async with httpx.AsyncClient(base_url="http://127.0.0.1:8099") as client:
         resp = await client.post("/api/safety/report_flood", json={"account_idx": 0, "seconds": 0})
@@ -11,6 +13,8 @@ async def test_rust_core_unauthorized_rejection():
 
 @pytest.mark.asyncio
 async def test_rust_core_health_and_auth():
+    if not await rust_bridge.is_healthy():
+        await rust_bridge.start_daemon()
     # /health is unauthenticated and reports status
     status = await rust_bridge.get_status()
     if status.get("active_accounts", 0) < 1:

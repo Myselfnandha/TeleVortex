@@ -35,6 +35,13 @@ async def get_device_auth_status(request: Request):
     """Checks whether server-level API_AUTH_TOKEN is required and if the current client is authenticated."""
     from app.auth import API_AUTH_TOKEN, ENABLE_API_AUTH, is_authenticated, is_loopback_request
     is_loopback = is_loopback_request(request)
+    if is_loopback and not API_AUTH_TOKEN and not ENABLE_API_AUTH:
+        return {
+            "auth_required": False,
+            "authenticated": True,
+            "is_loopback": True,
+            "has_token_configured": False
+        }
     must_auth = bool(API_AUTH_TOKEN) or ENABLE_API_AUTH or not is_loopback
     is_authed = is_authenticated(request)
     return {

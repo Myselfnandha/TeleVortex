@@ -332,6 +332,10 @@ class RustBridge:
                 return data
             self.chunks_failed += 1
             err_text = resp.text
+            if "SESSION_REVOKED" in err_text or "AUTH_KEY_UNREGISTERED" in err_text or resp.status_code == 401:
+                logger.warning(f"Rust core session revoked/unregistered on account {account_idx}. Tripping circuit for 60s.")
+                self.trip_circuit(60.0)
+                return None
             if "FLOOD" in err_text or resp.status_code == 429:
                 import re
                 m = re.search(r"Some\((\d+)\)", err_text) or re.search(r"FLOOD.*?(\d+)", err_text)

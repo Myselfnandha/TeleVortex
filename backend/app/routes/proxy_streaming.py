@@ -688,6 +688,7 @@ async def handle_proxy_download(
         if stop_event.is_set():
             return
 
+        seek_gen = stream_engine.get_seek_generation(norm_chat_id, message_id)
         gen = stream_engine.stream_media(
             client=client,
             chat_id=chat_id,
@@ -701,7 +702,8 @@ async def handle_proxy_download(
             message=message,
             get_fresh_message_fn=get_streamable_message,
             external_stop_event=stop_event,
-            request_id=req_id
+            request_id=req_id,
+            seek_generation=seek_gen
         )
         handle.it = gen
 

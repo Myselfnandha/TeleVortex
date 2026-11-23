@@ -87,14 +87,21 @@ class SeekEpisodeManager:
 
 
 class ChunkTask:
-    def __init__(self, key: Tuple[str, int, int]):
+    def __init__(self, key: Tuple[str, int, int], generation: int = 0, is_urgent: bool = False):
         self.key = key
+        self.generation = generation
+        self.is_urgent = is_urgent
         self.future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.subscribers: Set[str] = set()
-        self.priority: int = 4
+        self.priority: int = 0 if is_urgent else 4
         self.created_at: float = time.time()
         self.wire_task: Optional[asyncio.Task] = None
         self.completed: bool = False
+        # SFASE v1.0 Diagnostic Telemetry (ms)
+        self.t_queue: float = 0.0
+        self.t_rate: float = 0.0
+        self.t_wire: float = 0.0
+        self.source: str = "wire"
 
 
 class StreamEngine:
@@ -109,6 +116,7 @@ class StreamEngine:
         self._seek_generations: Dict[Tuple[str, int], int] = {}
         self._active_read_positions: Dict[Tuple[str, int], int] = {}
         self._retained_cleanup_tasks: Set[asyncio.Task] = set()
+        self._generation_stop_events: Dict[Tuple[str, int, int], asyncio.Event] = {}
 
     def _get_chunk_lock(self) -> asyncio.Lock:
         if self._chunk_lock is None:
@@ -127,9 +135,27 @@ class StreamEngine:
     def advance_seek_generation(self, chat_id: Union[str, int], message_id: int, new_offset: int, chunk_size: int = 512 * 1024) -> int:
         norm_cid = StreamSlidingBuffer._canonical_cid(chat_id)
         key = (norm_cid, int(message_id))
-        gen = self._seek_generations.get(key, 0) + 1
+        prev_gen = self._seek_generations.get(key, 0)
+        gen = prev_gen + 1
         self._seek_generations[key] = gen
         self.seek_episode_manager.observe(norm_cid, int(message_id), new_offset, chunk_size)
+
+        # Invalidate old generation stop events
+        if prev_gen > 0:
+            old_gen_ev = self._generation_stop_events.pop((norm_cid, int(message_id), prev_gen), None)
+            if old_gen_ev:
+                old_gen_ev.set()
+
+        # SFASE v1.0: Invalidate and cancel obsolete in-flight chunk tasks from superseded generations
+        for ckey, task in list(self._chunk_task_registry.items()):
+            if ckey[0] == norm_cid and ckey[1] == int(message_id):
+                if getattr(task, "generation", 0) < gen and not task.completed:
+                    c_offset = ckey[2] if len(ckey) > 2 else 0
+                    if not stream_buffer.is_chunk_retained(norm_cid, int(message_id), c_offset):
+                        if task.wire_task and not task.wire_task.done():
+                            task.wire_task.cancel()
+                        if not task.future.done():
+                            task.future.cancel()
 
         prev_offset = self._active_read_positions.get(key)
         if prev_offset is not None and prev_offset != new_offset:
@@ -185,7 +211,8 @@ class StreamEngine:
         message: Optional[Any] = None,
         get_fresh_message_fn: Optional[Any] = None,
         external_stop_event: Optional[asyncio.Event] = None,
-        request_id: Optional[str] = None
+        request_id: Optional[str] = None,
+        seek_generation: Optional[int] = None
     ) -> AsyncGenerator[bytes, None]:
         t0 = time.time()
         bytes_sent = 0
@@ -197,6 +224,13 @@ class StreamEngine:
         media_key = (norm_cid, orig_mid)
         stream_wire_tasks = set()
 
+        if seek_generation is None:
+            seek_generation = self.get_seek_generation(norm_cid, orig_mid)
+            if seek_generation == 0 and start > 0:
+                seek_generation = self.advance_seek_generation(norm_cid, orig_mid, start)
+
+        gen_stop_event = self._generation_stop_events.setdefault((norm_cid, orig_mid, seek_generation), asyncio.Event())
+
         if not request_id:
             request_id = f"req_{uuid.uuid4().hex[:8]}"
 
@@ -207,8 +241,8 @@ class StreamEngine:
         if external_stop_event:
             self._active_stop_events[media_key].add(external_stop_event)
 
-        if external_stop_event and external_stop_event.is_set():
-            logger.debug(f"STREAM [{clean_name}] Aborted stream before start (superseded by seek)")
+        if (external_stop_event and external_stop_event.is_set()) or gen_stop_event.is_set():
+            logger.debug(f"STREAM [{clean_name}] Aborted stream before start (superseded by seek, gen {seek_generation})")
             return
 
         if cached_prefix and len(cached_prefix) >= length:
@@ -220,8 +254,12 @@ class StreamEngine:
         effective_start = start + cached_prefix_len
         remaining_length = length - cached_prefix_len
 
+        is_seek_stream = (start > 0)
         if length <= 256 * 1024 or (file_size > 0 and effective_start >= (file_size - 4 * 1024 * 1024)):
             chunk_size = 128 * 1024
+        elif is_media_player and is_seek_stream:
+            # SFASE v1.0: 512 KiB seek-aligned chunk size for instant TTFB
+            chunk_size = 512 * 1024
         else:
             chunk_size = 1024 * 1024
 
@@ -306,9 +344,16 @@ class StreamEngine:
         if media_key in self._active_stop_events:
             self._active_stop_events[media_key].add(stop_event)
 
-        async def _download_chunk_from_mtproto(target_offset: int, target_size: int, worker_client: Any, is_emergency: bool, is_head_chunk: bool = False) -> bytes:
+        async def _download_chunk_from_mtproto(
+            target_offset: int,
+            target_size: int,
+            worker_client: Any,
+            is_emergency: bool,
+            is_head_chunk: bool = False,
+            task_obj: Optional[ChunkTask] = None
+        ) -> bytes:
             nonlocal file_loc, message, active_clients
-            if stop_event.is_set() and not is_head_chunk:
+            if (stop_event.is_set() or gen_stop_event.is_set()) and not is_head_chunk:
                 is_cand = self.seek_episode_manager.is_candidate_window(norm_cid, message_id, target_offset, target_size)
                 is_retained = stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset)
                 if not is_cand and not is_retained:
@@ -317,11 +362,15 @@ class StreamEngine:
             if not cached_data and (orig_cid, orig_mid) != (norm_cid, message_id):
                 cached_data = stream_buffer.get_slice(orig_cid, orig_mid, target_offset, target_size)
             if cached_data and len(cached_data) == target_size:
+                if task_obj:
+                    task_obj.source = "RAM"
                 return cached_data
             disk_data = stream_cache_service.get_slice(norm_cid, message_id, target_offset, target_size)
             if not disk_data and (orig_cid, orig_mid) != (norm_cid, message_id):
                 disk_data = stream_cache_service.get_slice(orig_cid, orig_mid, target_offset, target_size)
             if disk_data and len(disk_data) == target_size:
+                if task_obj:
+                    task_obj.source = "Disk"
                 stream_buffer.push(norm_cid, message_id, target_offset, disk_data)
                 if (orig_cid, orig_mid) != (norm_cid, message_id):
                     stream_buffer.push(orig_cid, orig_mid, target_offset, disk_data)
@@ -335,7 +384,18 @@ class StreamEngine:
             access_hash = getattr(target_loc, "access_hash", None)
             file_ref = getattr(target_loc, "file_reference", None)
 
-            await rate_governor.acquire_chunk_slot(target_size, is_emergency=is_emergency, is_unlimited=not is_media_player)
+            # SFASE v1.0: Urgent Seek Gate: seek head chunk bypasses rate pacing delays
+            t_rate_start = time.monotonic()
+            is_urgent_seek = is_head_chunk and is_media_player
+            await rate_governor.acquire_chunk_slot(
+                target_size,
+                is_emergency=(is_emergency or is_urgent_seek),
+                is_unlimited=not is_media_player,
+                is_seek=is_urgent_seek
+            )
+            t_rate_ms = (time.monotonic() - t_rate_start) * 1000.0
+            if task_obj:
+                task_obj.t_rate = t_rate_ms
 
             if doc_id and access_hash and file_ref:
                 for rust_attempt in range(2):
@@ -343,7 +403,8 @@ class StreamEngine:
                         from app.services.rust_bridge import rust_bridge
                         if await rust_bridge.is_healthy():
                             target_account = active_clients.index(worker_client) if (worker_client in active_clients and id(worker_client) in worker_file_locs) else 0
-                            rust_timeout = 15.0 if is_media_player else 28.0
+                            rust_timeout = 8.0 if is_head_chunk else (15.0 if is_media_player else 28.0)
+                            t_wire_start = time.monotonic()
                             rust_data = await asyncio.wait_for(
                                 rust_bridge.stream_chunk(
                                     dc_id=dc_id,
@@ -352,12 +413,16 @@ class StreamEngine:
                                     file_reference=file_ref,
                                     offset=target_offset,
                                     limit=target_size,
-                                    priority="high" if (is_media_player or is_emergency) else "bulk",
+                                    priority="high" if (is_media_player or is_emergency or is_head_chunk) else "bulk",
                                     account_idx=target_account
                                 ),
                                 timeout=rust_timeout
                             )
                             if rust_data and len(rust_data) > 0:
+                                t_wire_ms = (time.monotonic() - t_wire_start) * 1000.0
+                                if task_obj:
+                                    task_obj.source = "Rust"
+                                    task_obj.t_wire = t_wire_ms
                                 stream_buffer.push(norm_cid, message_id, target_offset, rust_data)
                                 if file_size > 0 and target_offset >= (file_size - 4 * 1024 * 1024):
                                     stream_buffer.push_tail(norm_cid, message_id, target_offset, rust_data)
@@ -373,6 +438,7 @@ class StreamEngine:
                                     alt_access_hash = getattr(alt_loc, "access_hash", None)
                                     alt_file_ref = getattr(alt_loc, "file_reference", None)
                                     if alt_doc_id and alt_access_hash and alt_file_ref:
+                                        t_wire_start = time.monotonic()
                                         rust_data = await asyncio.wait_for(
                                             rust_bridge.stream_chunk(
                                                 dc_id=dc_id,
@@ -381,12 +447,16 @@ class StreamEngine:
                                                 file_reference=alt_file_ref,
                                                 offset=target_offset,
                                                 limit=target_size,
-                                                priority="high" if (is_media_player or is_emergency) else "bulk",
+                                                priority="high" if (is_media_player or is_emergency or is_head_chunk) else "bulk",
                                                 account_idx=alt_idx
                                             ),
                                             timeout=rust_timeout
                                         )
                                         if rust_data and len(rust_data) > 0:
+                                            t_wire_ms = (time.monotonic() - t_wire_start) * 1000.0
+                                            if task_obj:
+                                                task_obj.source = "Rust"
+                                                task_obj.t_wire = t_wire_ms
                                             stream_buffer.push(norm_cid, message_id, target_offset, rust_data)
                                             stream_cache_service.put_slice(norm_cid, message_id, target_offset, rust_data)
                                             if (orig_cid, orig_mid) != (norm_cid, message_id):
@@ -425,6 +495,9 @@ class StreamEngine:
                                         file_ref = getattr(target_loc, "file_reference", None)
                                         req = GetFileRequest(target_loc, offset=target_offset, limit=target_size)
                                         continue
+                        elif "SESSION_REVOKED" in err_s or "AUTH_KEY_UNREGISTERED" in err_s:
+                            rust_bridge.trip_circuit(60.0)
+                            break
                         if "FloodWait" in err_s or "cooldown" in err_s:
                             alternate_clients = [c for c in active_clients if c is not worker_client and not rate_governor.is_client_cooling_down(c)]
                             if alternate_clients:
@@ -438,26 +511,32 @@ class StreamEngine:
 
             file_ref_attempts = 0
             for attempt in range(6):
-                if stop_event.is_set() and not is_head_chunk and not stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset):
+                if (stop_event.is_set() or gen_stop_event.is_set()) and not is_head_chunk and not stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset):
                     raise asyncio.CancelledError("Stream aborted by seek")
                 try:
                     c_t0 = time.time()
-                    if stop_event.is_set() and not is_head_chunk and not stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset):
+                    t_wire_start = time.monotonic()
+                    if (stop_event.is_set() or gen_stop_event.is_set()) and not is_head_chunk and not stream_buffer.is_chunk_retained(norm_cid, message_id, target_offset):
                         raise asyncio.CancelledError("Stream aborted by seek")
-                    chunk_timeout = 16.0 if is_media_player else 25.0
+                    chunk_timeout = 10.0 if is_head_chunk else (16.0 if is_media_player else 25.0)
                     async with self._get_mtproto_sem():
-                        async with sender_pool.borrow(worker_client, dc_id, priority=is_media_player) as s:
+                        async with sender_pool.borrow(worker_client, dc_id, priority=(is_media_player or is_emergency or is_head_chunk)) as s:
                             res = await asyncio.wait_for(
                                 worker_client._call(s, req, flood_sleep_threshold=0),
                                 timeout=chunk_timeout
                             )
                     c_dt = max(0.001, time.time() - c_t0)
+                    t_wire_ms = (time.monotonic() - t_wire_start) * 1000.0
                     if hasattr(res, "bytes"):
                         data = res.bytes
                     elif isinstance(res, (bytes, bytearray)):
                         data = bytes(res)
                     else:
                         data = b""
+
+                    if task_obj:
+                        task_obj.source = "PyTelethon"
+                        task_obj.t_wire = t_wire_ms
 
                     stream_buffer.push(norm_cid, message_id, target_offset, data)
                     stream_cache_service.put_slice(norm_cid, message_id, target_offset, data)
@@ -470,7 +549,7 @@ class StreamEngine:
                     c_speed = (len(data) / (1024 * 1024)) / c_dt
                     logger.info(
                         f"STREAM [{clean_name}] Chunk at {target_offset:,}: "
-                        f"{len(data):,}B in {c_dt:.2f}s ({c_speed:.1f} MB/s) from DC {dc_id}"
+                        f"{len(data):,}B in {c_dt:.2f}s ({c_speed:.1f} MB/s) from DC {dc_id} (Telethon fallback)"
                     )
                     return data
 
@@ -592,7 +671,7 @@ class StreamEngine:
             nonlocal file_loc, message, active_clients
             if worker_client is None:
                 worker_client = client
-            if stop_event.is_set():
+            if stop_event.is_set() or gen_stop_event.is_set():
                 is_cand = self.seek_episode_manager.is_candidate_window(norm_cid, message_id, aligned_offset + (c_idx * chunk_size), chunk_size)
                 is_retained = stream_buffer.is_chunk_retained(norm_cid, message_id, aligned_offset + (c_idx * chunk_size))
                 if not is_cand and not is_retained:
@@ -620,7 +699,7 @@ class StreamEngine:
             async with lock:
                 task_obj = self._chunk_task_registry.get(chunk_key)
                 if task_obj is None or task_obj.future.done():
-                    task_obj = ChunkTask(chunk_key)
+                    task_obj = ChunkTask(chunk_key, generation=seek_generation, is_urgent=(c_idx == 0))
                     task_obj.subscribers.add(request_id)
                     task_obj.priority = 0 if c_idx == 0 else (1 if is_emergency else 3)
                     self._chunk_task_registry[chunk_key] = task_obj
@@ -630,6 +709,8 @@ class StreamEngine:
                     task_obj.subscribers.add(request_id)
                     if c_idx == 0:
                         task_obj.priority = 0
+                        task_obj.is_urgent = True
+                        task_obj.generation = seek_generation
                     elif is_emergency and task_obj.priority > 1:
                         task_obj.priority = 1
                     is_lead = False
@@ -638,15 +719,16 @@ class StreamEngine:
             if is_lead:
                 async def _background_wire_runner():
                     try:
-                        if stop_event.is_set() and c_idx > 0:
+                        if (stop_event.is_set() or gen_stop_event.is_set()) and c_idx > 0:
                             is_cand = self.seek_episode_manager.is_candidate_window(norm_cid, message_id, c_offset, chunk_size)
                             is_retained = stream_buffer.is_chunk_retained(norm_cid, message_id, c_offset)
                             if not is_cand and not is_retained:
                                 if not wire_fut.done():
                                     wire_fut.cancel()
                                 return
+                        task_obj.t_queue = (time.time() - task_obj.created_at) * 1000.0
                         data = await _download_chunk_from_mtproto(
-                            c_offset, chunk_size, worker_client, is_emergency, is_head_chunk=(c_idx == 0)
+                            c_offset, chunk_size, worker_client, is_emergency, is_head_chunk=(c_idx == 0), task_obj=task_obj
                         )
                         task_obj.completed = True
                         if not wire_fut.done():
@@ -690,7 +772,8 @@ class StreamEngine:
                 if not task_obj.subscribers:
                     is_cand = self.seek_episode_manager.is_candidate_window(norm_cid, message_id, c_offset, chunk_size)
                     is_retained = stream_buffer.is_chunk_retained(norm_cid, message_id, c_offset)
-                    if not is_cand and not is_retained and (time.time() - task_obj.created_at) > 10.0:
+                    is_stale = (self.get_seek_generation(norm_cid, message_id) > getattr(task_obj, "generation", 0))
+                    if not is_retained and (is_stale or (time.time() - task_obj.created_at) > 1.0):
                         if task_obj.wire_task and not task_obj.wire_task.done():
                             task_obj.wire_task.cancel()
                         if not wire_fut.done():
@@ -795,7 +878,12 @@ class StreamEngine:
                     return False
 
                 try:
-                    while next_to_deliver < total_chunks and not stop_event.is_set():
+                    while next_to_deliver < total_chunks and not stop_event.is_set() and not gen_stop_event.is_set():
+                        # SFASE v1.0: Superseded generation check
+                        if self.get_seek_generation(norm_cid, orig_mid) > seek_generation:
+                            logger.debug(f"STREAM [{clean_name}] Pipelined producer superseded (gen {seek_generation} < active)")
+                            break
+
                         while next_to_deliver in buffered and not stop_event.is_set():
                             data = buffered.pop(next_to_deliver)
                             if not await _put_chunk(data):
@@ -808,18 +896,21 @@ class StreamEngine:
                         runway = queue.qsize() + len(buffered)
                         if is_media_player:
                             if next_to_deliver == 0:
+                                # SFASE v1.0: Urgent Seek Gate: exactly 1 chunk in flight until seek target arrives!
+                                allowed_in_flight = 1
+                            elif next_to_deliver <= 2:
                                 allowed_in_flight = 2
-                            elif runway < 12 or wire_speed_mb_s <= 1.5:
-                                allowed_in_flight = 8 if (is_premium_rate or is_multi_account) else 6
-                            elif runway >= 20:
-                                allowed_in_flight = 3
-                                if runway >= 24:
+                            elif runway < 8 or wire_speed_mb_s <= 1.5:
+                                allowed_in_flight = 4 if (is_premium_rate or is_multi_account) else 3
+                            elif runway >= 16:
+                                allowed_in_flight = 2
+                                if runway >= 20:
                                     await asyncio.sleep(0.02)
                             else:
-                                allowed_in_flight = 4
+                                allowed_in_flight = 3
                         else:
                             if next_to_deliver == 0:
-                                allowed_in_flight = min(4, max_in_flight)
+                                allowed_in_flight = 1
                             elif runway >= max_lookahead - 4:
                                 allowed_in_flight = 3
                             else:
@@ -830,6 +921,8 @@ class StreamEngine:
                             and (queue.qsize() + len(in_flight) + len(buffered)) < max_lookahead
                             and next_to_fetch < total_chunks
                             and not stop_event.is_set()
+                            and not gen_stop_event.is_set()
+                            and self.get_seek_generation(norm_cid, orig_mid) <= seek_generation
                         ):
                             healthy_clients = [c for c in active_clients if not rate_governor.is_client_cooling_down(c)]
                             if not healthy_clients:
@@ -976,7 +1069,16 @@ class StreamEngine:
                 if not first_chunk_sent:
                     first_chunk_sent = True
                     ttfb = time.time() - t0
-                    logger.info(f"STREAM [{clean_name}] Seek target chunk 1/{total_chunks} ({len(chunk):,}B) delivered in {ttfb:.3f}s (TTFB)")
+                    # SFASE v1.0: Extract detailed timing diagnostics
+                    head_task = self._chunk_task_registry.get((norm_cid, int(orig_mid), aligned_offset))
+                    q_wait = getattr(head_task, "t_queue", 0.0) if head_task else 0.0
+                    rate_wait = getattr(head_task, "t_rate", 0.0) if head_task else 0.0
+                    wire_dur = getattr(head_task, "t_wire", 0.0) if head_task else 0.0
+                    src_tag = getattr(head_task, "source", "wire") if head_task else "wire"
+                    logger.info(
+                        f"STREAM [{clean_name}] Seek target chunk 1/{total_chunks} ({len(chunk):,}B) delivered in {ttfb:.3f}s (TTFB) "
+                        f"[queue={q_wait:.1f}ms, rate={rate_wait:.1f}ms, wire={wire_dur:.1f}ms, src={src_tag}, gen={seek_generation}]"
+                    )
 
                 feed_pos += len(chunk)
 

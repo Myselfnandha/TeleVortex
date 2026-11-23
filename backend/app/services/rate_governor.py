@@ -236,8 +236,15 @@ class RateGovernor:
         if not self.is_cooling_down and not self._cooldown_event.is_set():
             self._cooldown_event.set()
 
-    async def acquire_chunk_slot(self, chunk_size_bytes: int = 1024 * 1024, is_emergency: bool = False, is_unlimited: bool = False):
-        if is_emergency:
+    async def acquire_chunk_slot(
+        self,
+        chunk_size_bytes: int = 1024 * 1024,
+        is_emergency: bool = False,
+        is_unlimited: bool = False,
+        is_seek: bool = False
+    ):
+        if is_emergency or is_seek:
+            # SFASE v1.0: Urgent seek requests immediately bypass pacing delays
             return
 
         was_cooling = self.is_cooling_down

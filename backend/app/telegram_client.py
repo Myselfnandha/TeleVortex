@@ -1891,8 +1891,16 @@ class MTProtoSenderPool:
                     except Exception:
                         pass
                 self._active_senders.pop(k, None)
-        if client and hasattr(client, "_borrowed_senders") and isinstance(client._borrowed_senders, dict):
-            client._borrowed_senders.pop(dc_id, None)
+
+        clients = [client] if client is not None else [getattr(TelegramClientManager, "_client", None), getattr(TelegramClientManager, "_secondary_client", None)]
+        for c in clients:
+            if c and hasattr(c, "_borrowed_senders") and isinstance(c._borrowed_senders, dict):
+                borrowed_entry = c._borrowed_senders.pop(dc_id, None)
+                if borrowed_entry and len(borrowed_entry) > 1 and borrowed_entry[1]:
+                    try:
+                        await borrowed_entry[1].disconnect()
+                    except Exception:
+                        pass
 
     async def disconnect_all(self, client=None):
         if self._keepalive_task and not self._keepalive_task.done():
@@ -1916,8 +1924,17 @@ class MTProtoSenderPool:
             self._last_active.clear()
             if hasattr(self, "_prewarming_keys"):
                 self._prewarming_keys.clear()
-        if client and hasattr(client, "_borrowed_senders") and isinstance(client._borrowed_senders, dict):
-            client._borrowed_senders.clear()
+
+        clients = [client] if client is not None else [getattr(TelegramClientManager, "_client", None), getattr(TelegramClientManager, "_secondary_client", None)]
+        for c in clients:
+            if c and hasattr(c, "_borrowed_senders") and isinstance(c._borrowed_senders, dict):
+                for b_dc, borrowed_entry in list(c._borrowed_senders.items()):
+                    if borrowed_entry and len(borrowed_entry) > 1 and borrowed_entry[1]:
+                        try:
+                            await borrowed_entry[1].disconnect()
+                        except Exception:
+                            pass
+                c._borrowed_senders.clear()
 
 
 sender_pool = MTProtoSenderPool(max_per_dc=32)

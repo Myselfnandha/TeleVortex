@@ -241,3 +241,30 @@ def test_acrm_jittered_backoff_formula(acrm):
         delay = config.compute_backoff(attempt)
         cap = min(30.0, 0.5 * (2 ** attempt))
         assert 0.0 <= delay <= cap
+
+
+@pytest.mark.asyncio
+async def test_acrm_foreign_dc_recovery(acrm):
+    """
+    Verify that foreign DC (DC 4 when session is DC 5) does not falsely
+    short-circuit on client.is_connected(), but properly executes foreign DC recovery.
+    """
+    scope = RecoveryScope(tenant_id="t1", account_id="acc1", dc_id=4, transport="telethon")
+
+    mock_client = MagicMock()
+    mock_client.session.dc_id = 5
+    mock_client.is_connected.return_value = True
+
+    mock_foreign_sender = MagicMock()
+    mock_foreign_sender.is_connected.return_value = True
+    mock_client._borrow_exported_sender = AsyncMock(return_value=mock_foreign_sender)
+
+    state = await acrm.recover_connection(
+        scope=scope,
+        reason=RecoveryReason.SOCKET_RESET,
+        client=mock_client
+    )
+
+    assert state == ConnectionState.CONNECTED
+    # Must have called _borrow_exported_sender for DC 4!
+    mock_client._borrow_exported_sender.assert_called_once_with(4)

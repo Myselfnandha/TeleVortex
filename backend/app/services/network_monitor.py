@@ -199,6 +199,10 @@ class NetworkMonitor:
                 f"Reconnecting Telegram MTProto and resuming transfers."
             )
             try:
+                await sender_pool.disconnect_all()
+            except Exception as pe:
+                logger.debug(f"NetworkMonitor: Post-reconnect sender pool refresh notice: {pe}")
+            try:
                 from app.services.connection_recovery import connection_recovery_manager
                 await connection_recovery_manager.notify_network_changed(True, reason="reconnected")
             except Exception:

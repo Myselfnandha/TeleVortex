@@ -465,16 +465,17 @@ async def handle_proxy_download(
     sec_fetch_dest = request.headers.get("sec-fetch-dest", "").lower()
     is_browser_media = sec_fetch_dest in ("video", "audio")
 
+    has_playback_auth = bool(grant_token or grant or request.headers.get("X-Playback-Session-Id"))
     if has_dm_query or is_known_dm_ua:
         is_media_player = False
         is_dm = True
-    elif is_dedicated_player or is_browser_media:
+    elif is_dedicated_player or is_browser_media or has_playback_auth:
         is_media_player = True
         is_dm = False
     else:
         is_spoofed_dm = (pragma_no_cache or cc_no_cache) and has_keepalive and no_sec_fetch
-        is_multi_conn = len(_ACTIVE_MEDIA_CONNS.get(media_key, ())) >= 1
-        is_dm = is_spoofed_dm or is_multi_conn or no_sec_fetch
+        is_multi_conn = len(_ACTIVE_MEDIA_CONNS.get(media_key, ())) > 1
+        is_dm = is_spoofed_dm and is_multi_conn
         is_media_player = not is_dm
 
     if start > 0 and not is_dm:

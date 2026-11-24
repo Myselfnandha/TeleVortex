@@ -694,13 +694,14 @@ class StreamEngine:
                     logger.warning(f"STREAM [{clean_name}] Network/socket glitch on DC {dc_id} (attempt {attempt+1}/6): {err_str}")
 
                     if "Unable to establish MTProto connection" in err_str:
-                        rate_governor.report_flood_wait(300, f"Worker failure DC {dc_id}", client=worker_client, all_clients_in_pool=active_clients)
-                        alternate_clients = [c for c in active_clients if c is not worker_client and not rate_governor.is_client_cooling_down(c)]
-                        if alternate_clients:
-                            worker_client = alternate_clients[0]
-                            target_loc = worker_file_locs.get(id(worker_client), file_loc)
-                            req = GetFileRequest(target_loc, offset=target_offset, limit=target_size)
-                            continue
+                        if len(active_clients) > 1:
+                            alternate_clients = [c for c in active_clients if c is not worker_client and not rate_governor.is_client_cooling_down(c)]
+                            if alternate_clients:
+                                logger.info(f"STREAM [{clean_name}] Rotating from failed worker to alternate client on DC {dc_id}")
+                                worker_client = alternate_clients[0]
+                                target_loc = worker_file_locs.get(id(worker_client), file_loc)
+                                req = GetFileRequest(target_loc, offset=target_offset, limit=target_size)
+                                continue
 
                     from app.services.connection_recovery import (
                         connection_recovery_manager,
@@ -778,10 +779,10 @@ class StreamEngine:
 
                 except Exception as fe:
                     fe_s = str(fe)
-                    if "FloodWait" in fe_s or "cooldown" in fe_s or "Unable to establish MTProto connection" in fe_s:
-                        rate_governor.report_flood_wait(300, f"Worker failure DC {dc_id}", client=worker_client, all_clients_in_pool=active_clients)
+                    if len(active_clients) > 1 and ("cooldown" in fe_s or "Unable to establish MTProto connection" in fe_s):
                         alternate_clients = [c for c in active_clients if c is not worker_client and not rate_governor.is_client_cooling_down(c)]
                         if alternate_clients:
+                            logger.info(f"STREAM [{clean_name}] Rotating from failed worker to alternate client on DC {dc_id}")
                             worker_client = alternate_clients[0]
                             target_loc = worker_file_locs.get(id(worker_client), file_loc)
                             req = GetFileRequest(target_loc, offset=target_offset, limit=target_size)

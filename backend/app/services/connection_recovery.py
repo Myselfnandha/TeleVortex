@@ -118,6 +118,9 @@ class AdaptiveConnectionRecoveryManager:
     def is_quarantined(self, scope: RecoveryScope) -> bool:
         return scope.key() in self._quarantined_sessions
 
+    def is_quarantined_by_key(self, key: str) -> bool:
+        return key in self._quarantined_sessions
+
     def unquarantine_session(self, scope: RecoveryScope):
         k = scope.key()
         self._quarantined_sessions.discard(k)
@@ -198,8 +201,17 @@ class AdaptiveConnectionRecoveryManager:
     ) -> ConnectionState:
         k = scope.key()
         async with scope_lock:
+            # Determine if this scope is a foreign DC relative to client's primary session
+            primary_dc = getattr(getattr(client, "session", None), "dc_id", None)
+            is_foreign_dc = bool(
+                scope.dc_id is not None
+                and primary_dc is not None
+                and scope.dc_id != primary_dc
+                and scope.transport == "telethon"
+            )
+
             # Re-check state once lock acquired (another task may have just resolved it)
-            if client is not None and hasattr(client, "is_connected") and client.is_connected():
+            if not is_foreign_dc and client is not None and hasattr(client, "is_connected") and client.is_connected():
                 if verify_coro:
                     try:
                         ok = await asyncio.wait_for(verify_coro(), timeout=self.config.connection_timeout)
@@ -231,6 +243,21 @@ class AdaptiveConnectionRecoveryManager:
                             on_reconnect_coro(),
                             timeout=self.config.connection_timeout
                         )
+                    elif is_foreign_dc:
+                        # Foreign DC recovery: Purge stale senders and re-borrow/export auth
+                        from app.telegram_client import sender_pool
+                        await sender_pool.purge_dc(scope.dc_id, client=client)
+                        if client is not None:
+                            if hasattr(client, "is_connected") and not client.is_connected():
+                                await asyncio.wait_for(client.connect(), timeout=self.config.connection_timeout)
+                            if hasattr(client, "_borrow_exported_sender"):
+                                foreign_s = await asyncio.wait_for(
+                                    client._borrow_exported_sender(scope.dc_id),
+                                    timeout=self.config.connection_timeout
+                                )
+                                reconnect_ok = bool(foreign_s and hasattr(foreign_s, "is_connected") and foreign_s.is_connected())
+                            else:
+                                reconnect_ok = True
                     elif client is not None:
                         if hasattr(client, "connect"):
                             await asyncio.wait_for(client.connect(), timeout=self.config.connection_timeout)
@@ -282,10 +309,19 @@ class AdaptiveConnectionRecoveryManager:
                 if self._states[k] not in (ConnectionState.AUTH_REQUIRED, ConnectionState.COOLDOWN):
                     self._states[k] = ConnectionState.DEGRADED
         else:
+            # Clear any temporary network-drop cooldowns
+            try:
+                from app.services.rate_governor import rate_governor
+                if "Worker failure" in getattr(rate_governor, "_cooldown_reason", ""):
+                    rate_governor.reset()
+            except Exception:
+                pass
+
             # Resume recovering eligible scopes immediately without waiting for backoff timers
             for k in list(self._states.keys()):
-                if self._states[k] in (ConnectionState.DEGRADED, ConnectionState.BACKOFF):
-                    self._states[k] = ConnectionState.RECOVERING
+                if self._states[k] in (ConnectionState.DEGRADED, ConnectionState.BACKOFF, ConnectionState.COOLDOWN):
+                    if not self.is_quarantined_by_key(k):
+                        self._states[k] = ConnectionState.RECOVERING
 
 
 # Global Singleton ACRM instance with Balanced Profile

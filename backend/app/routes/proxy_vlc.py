@@ -36,9 +36,29 @@ class PlaybackProgressPayload(BaseModel):
     filename: str
     position_seconds: float
     duration_seconds: float
+    file_size: Optional[int] = 0
     thumbnail_url: Optional[str] = None
     last_chunk_index: Optional[int] = 0
     last_byte_offset: Optional[int] = 0
+
+
+async def _emit_continue_watching_update(chat_id: str, message_id: int):
+    try:
+        from app.socket_handlers import sio
+        await sio.emit(
+            "media:continue_watching_updated",
+            {"chat_id": str(chat_id), "message_id": int(message_id)},
+        )
+    except Exception:
+        pass
+
+
+async def _wait_and_notify_vlc_exit(proc: subprocess.Popen, chat_id: str, message_id: int):
+    try:
+        await asyncio.to_thread(proc.wait)
+    except Exception:
+        pass
+    await _emit_continue_watching_update(chat_id, message_id)
 
 
 @router.post("/api/media/vlc/play", dependencies=[Depends(verify_auth)])
@@ -137,7 +157,7 @@ async def launch_desktop_vlc(chat_id: str, message_id: int, request: Request, fi
             close_fds=True,
         )
         if hasattr(proc, "wait"):
-            asyncio.create_task(asyncio.to_thread(proc.wait))
+            asyncio.create_task(_wait_and_notify_vlc_exit(proc, str(clean_chat_id), message_id))
     except OSError as exc:
         logger.exception("Could not launch VLC")
         raise HTTPException(status_code=500, detail=f"Failed to launch VLC: {exc}")
@@ -211,7 +231,7 @@ async def launch_vlc_batch(payload: Dict[str, Any], request: Request):
             close_fds=True,
         )
         if hasattr(proc, "wait"):
-            asyncio.create_task(asyncio.to_thread(proc.wait))
+            asyncio.create_task(_wait_and_notify_vlc_exit(proc, str(clean_chat_id), message_id))
     except OSError as exc:
         logger.exception("Could not launch batch VLC")
         raise HTTPException(status_code=500, detail=f"Failed to launch VLC: {exc}")
@@ -316,20 +336,24 @@ async def get_continue_watching():
 async def dismiss_continue_watching(chat_id: str, message_id: int):
     """Dismisses an item from continue watching."""
     await playback_tracker.aremove_progress(chat_id, message_id)
+    await _emit_continue_watching_update(chat_id, message_id)
     return {"success": True, "dismissed": f"{chat_id}_{message_id}"}
 
 
 @router.post("/api/media/playback_progress", dependencies=[Depends(verify_auth)])
 async def update_playback_progress_api(payload: PlaybackProgressPayload):
     """Updates watch progress for a video with chunk coordinates."""
+    playback_tracker.mark_player_heartbeat(payload.chat_id, payload.message_id)
     await playback_tracker.aupdate_progress(
         chat_id=payload.chat_id,
         message_id=payload.message_id,
         filename=payload.filename,
         last_position_seconds=payload.position_seconds,
         duration_seconds=payload.duration_seconds,
+        file_size=payload.file_size or 0,
         thumbnail_url=payload.thumbnail_url,
         last_chunk_index=payload.last_chunk_index or 0,
         last_byte_offset=payload.last_byte_offset or 0
     )
+    await _emit_continue_watching_update(payload.chat_id, payload.message_id)
     return {"status": "ok"}

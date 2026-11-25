@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException, Request, Response, Depends
 from app.auth import verify_auth
 from app.telegram_client import TelegramClientManager
 from app.services.cinema_catalog import get_streamable_message
+from app.services.stream_buffer import _SLIDING_STREAM_BUFFER, StreamSlidingBuffer
+from app.services.stream_cache import stream_cache_service
 from app.services.subtitle_service import subtitle_service
 from app.services.sniffer_service import sniffer_service
 
@@ -16,6 +18,26 @@ logger = logging.getLogger("proxy_subtitles")
 router = APIRouter(tags=["proxy_subtitles"])
 
 _SUBTITLE_CACHE = {}
+
+
+async def _resolve_subtitle_client(request: Request):
+    principal = getattr(request.state, "principal", None)
+    grant = getattr(request.state, "grant", None)
+    tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
+    if tenant_user_id:
+        from app.telegram.client_manager import multi_tenant_manager
+        from app.auth_v3.session_service import Principal
+        import uuid
+        t_principal = principal or Principal(
+            user_id=grant.user_id,
+            session_id=uuid.uuid4(),
+            device_id=None,
+            role="user",
+            display_name="GrantUser",
+        )
+        client = await multi_tenant_manager.get_client(t_principal, account_id=getattr(grant, "account_id", None))
+        return client, tenant_user_id
+    return await TelegramClientManager.get_client(), None
 
 
 @router.get("/api/media/subtitles/{chat_id}/{message_id}/{sub_index}.vtt")
@@ -33,13 +55,13 @@ async def get_stream_subtitles(chat_id: str, message_id: int, sub_index: int, re
         except ValueError:
             clean_chat_id = chat_id
 
-    cache_key = (clean_chat_id, message_id, sub_index, fmt)
-    if cache_key in _SUBTITLE_CACHE:
-        return Response(content=_SUBTITLE_CACHE[cache_key], media_type=media_type)
-
-    client = await TelegramClientManager.get_client()
+    client, tenant_user_id = await _resolve_subtitle_client(request)
     if not client or not client.is_connected():
         raise HTTPException(status_code=503, detail="Telegram client is not connected.")
+
+    cache_key = (str(tenant_user_id or "default"), clean_chat_id, message_id, sub_index, fmt)
+    if cache_key in _SUBTITLE_CACHE:
+        return Response(content=_SUBTITLE_CACHE[cache_key], media_type=media_type)
 
     message = sniffer_service._message_cache.get((clean_chat_id, message_id))
     if not message or not getattr(message, "media", None):
@@ -62,20 +84,29 @@ async def get_stream_subtitles(chat_id: str, message_id: int, sub_index: int, re
         except Exception as read_err:
             logger.debug(f"Cached subtitle read error: {read_err}")
 
+    cached_media = stream_cache_service.get_cached_file(str(chat_id), message_id, user_id=tenant_user_id)
+    sub_target = str(cached_media) if (cached_media and cached_media.exists()) else "pipe:0"
     sub_buffer = bytearray()
-    try:
-        async for chunk in client.iter_download(message.media, request_size=256*1024, chunk_size=256*1024):
-            sub_buffer.extend(chunk)
-            if len(sub_buffer) >= 2000 * 1024:
-                break
-    except Exception:
-        pass
+
+    if sub_target == "pipe:0":
+        norm_cid = StreamSlidingBuffer._canonical_cid(clean_chat_id)
+        ram_head = _SLIDING_STREAM_BUFFER.get_slice(norm_cid, message_id, 0, 1500 * 1024)
+        if ram_head:
+            sub_buffer.extend(ram_head)
+        else:
+            try:
+                async for chunk in client.iter_download(message.media, request_size=256*1024, chunk_size=256*1024):
+                    sub_buffer.extend(chunk)
+                    if len(sub_buffer) >= 1500 * 1024:
+                        break
+            except Exception:
+                pass
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-i", "pipe:0",
+        "-i", sub_target,
         "-map", f"0:s:{sub_index}?",
         "-c:s", "subrip" if is_srt else "webvtt",
         "-f", fmt,
@@ -84,13 +115,13 @@ async def get_stream_subtitles(chat_id: str, message_id: int, sub_index: int, re
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if sub_target == "pipe:0" else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout_data, _ = await proc.communicate(input=bytes(sub_buffer))
+        stdout_data, _ = await proc.communicate(input=bytes(sub_buffer) if sub_target == "pipe:0" else None)
         if not stdout_data:
-            stdout_data = b"1\n00:00:01,000 --> 00:00:05,000\n[Subtitles Active]\n" if is_srt else b"WEBVTT\n\n1\n00:00:01.000 --> 00:00:05.000\n[Subtitles Active]\n"
+            stdout_data = b"" if is_srt else b"WEBVTT\n\n"
         _SUBTITLE_CACHE[cache_key] = stdout_data
         return Response(content=stdout_data, media_type=media_type)
     except Exception as e:

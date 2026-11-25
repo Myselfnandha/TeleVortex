@@ -30,9 +30,9 @@ def test_r1_docked_channel_picker_proportional_width():
     picker_file = FRONTEND_DIR / "src" / "components" / "DockedChannelPicker.tsx"
     assert picker_file.exists()
     content = picker_file.read_text(encoding="utf-8")
-    assert "w-[18%]" in content
-    assert "min-w-[190px]" in content
-    assert "max-w-[260px]" in content
+    assert "w-[26%]" in content
+    assert "min-w-[240px]" in content
+    assert "max-w-[360px]" in content
     assert "shrink-0" in content
 
 def test_r1_docked_continue_watching_proportional_width():

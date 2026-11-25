@@ -13,6 +13,7 @@ class SocketService {
   private snifferFeedListeners = new Set<Listener<SnifferFeedItem>>();
   private cinemaUpdateListeners = new Set<Listener<any>>();
   private dialogUpdateListeners = new Set<Listener<any>>();
+  private continueWatchingListeners = new Set<Listener<any>>();
   private floodWaitListeners = new Set<Listener<{ active: boolean; seconds: number; message?: string }>>();
   private networkStatusListeners = new Set<Listener<{ online: boolean; reason?: string; ip?: string }>>();
 
@@ -78,6 +79,10 @@ class SocketService {
       this.dialogUpdateListeners.forEach((fn) => fn(data));
     });
 
+    this.socket.on('media:continue_watching_updated', (data: any) => {
+      this.continueWatchingListeners.forEach((fn) => fn(data));
+    });
+
     this.socket.on('floodwait:status', (data: { active: boolean; seconds: number; message?: string }) => {
       this.floodWaitListeners.forEach((fn) => fn(data));
     });
@@ -121,6 +126,11 @@ class SocketService {
   onDialogUpdate(fn: Listener<any>): () => void {
     this.dialogUpdateListeners.add(fn);
     return () => this.dialogUpdateListeners.delete(fn);
+  }
+
+  onContinueWatchingUpdate(fn: Listener<any>): () => void {
+    this.continueWatchingListeners.add(fn);
+    return () => this.continueWatchingListeners.delete(fn);
   }
 
   onFloodWait(fn: Listener<{ active: boolean; seconds: number; message?: string }>): () => void {

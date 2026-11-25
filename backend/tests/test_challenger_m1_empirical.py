@@ -98,7 +98,7 @@ def test_viewport_range_layout_clipping_and_overflow(browser_context):
         right_w = metrics["rightRect"]["width"]
         center_w = metrics["centerRect"]["width"]
 
-        assert 185 <= left_w <= 265, f"Left dock width out of bounds at {width}px: {left_w}"
+        assert 235 <= left_w <= 365, f"Left dock width out of bounds at {width}px: {left_w}"
         assert 185 <= right_w <= 265, f"Right dock width out of bounds at {width}px: {right_w}"
         assert center_w > 400, f"Center catalog crushed or too small at {width}px: {center_w}"
 

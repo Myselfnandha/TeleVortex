@@ -83,6 +83,64 @@ class StreamIteratorHandle:
                 pass
 
 
+async def _resolve_streaming_client(
+    request: Request,
+    chat_id: str = "",
+    message_id: int = 0,
+    enforce_mt_guard: bool = False,
+):
+    """Resolve the Telegram client for single-tenant or v3 multi-tenant streaming."""
+    principal = getattr(request.state, "principal", None)
+    grant = getattr(request.state, "grant", None)
+    tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
+
+    grant_token = None
+    try:
+        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
+    except Exception:
+        pass
+    if grant_token:
+        is_token_valid = grant is not None
+        if not is_token_valid:
+            try:
+                is_token_valid = playback_grants.allows(
+                    grant_token,
+                    chat_id,
+                    message_id,
+                    tenant_id=tenant_user_id,
+                )
+            except Exception:
+                is_token_valid = False
+        if not is_token_valid:
+            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
+
+    if tenant_user_id:
+        from app.telegram.client_manager import multi_tenant_manager
+        from app.auth_v3.session_service import Principal
+        t_principal = principal or Principal(
+            user_id=grant.user_id,
+            session_id=uuid.uuid4(),
+            device_id=None,
+            role="user",
+            display_name="GrantUser"
+        )
+        client = await multi_tenant_manager.get_client(t_principal, account_id=getattr(grant, "account_id", None))
+        if not client or not client.is_connected():
+            raise HTTPException(status_code=503, detail="Telegram client is not connected.")
+        return client, principal, grant, tenant_user_id
+
+    if enforce_mt_guard:
+        from app.config import MULTI_TENANT_STREAMING_ENABLED
+        is_mt = MULTI_TENANT_STREAMING_ENABLED or os.getenv("MULTI_TENANT_STREAMING_ENABLED", "").lower() in ("true", "1", "yes")
+        if is_mt:
+            raise HTTPException(status_code=401, detail="Authentication required: No tenant session or playback grant provided.")
+
+    client = await TelegramClientManager.get_client()
+    if not client or not client.is_connected():
+        raise HTTPException(status_code=503, detail="Telegram client is not connected.")
+    return client, principal, grant, None
+
+
 async def _safe_drain_task(t: asyncio.Task):
     try:
         await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
@@ -847,48 +905,7 @@ async def handle_transmux_stream(
     If cached on local disk, runs FFmpeg directly against local file (<10ms start & instant seeks).
     """
     # Resolve Tenant Context if v3 session or Playback Grant is present
-    principal = getattr(request.state, "principal", None)
-    grant = getattr(request.state, "grant", None)
-    tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
-
-    # Defense-in-depth: enforce playback token validity even if middleware was bypassed
-    grant_token = None
-    try:
-        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
-    except Exception:
-        pass
-    if grant_token:
-        is_token_valid = False
-        if grant is not None:
-            is_token_valid = True
-        else:
-            try:
-                from app.services.vlc_playback import playback_grants
-                is_token_valid = playback_grants.allows(
-                    grant_token, chat_id, message_id, tenant_id=tenant_user_id
-                )
-            except Exception:
-                is_token_valid = False
-        if not is_token_valid:
-            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
-
-    if tenant_user_id:
-        from app.telegram.client_manager import multi_tenant_manager
-        from app.auth_v3.session_service import Principal
-        t_principal = principal or Principal(
-            user_id=grant.user_id,
-            session_id=uuid.uuid4(),
-            device_id=None,
-            role="user",
-            display_name="GrantUser"
-        )
-        client = await multi_tenant_manager.get_client(t_principal, account_id=getattr(grant, "account_id", None))
-        if not client or not client.is_connected():
-            raise HTTPException(status_code=503, detail="Telegram client is not connected.")
-    else:
-        client = await TelegramClientManager.get_client()
-        if not client or not client.is_connected():
-            raise HTTPException(status_code=503, detail="Telegram client is not connected.")
+    client, principal, grant, tenant_user_id = await _resolve_streaming_client(request, chat_id, message_id)
 
     clean_chat_id: Union[int, str] = chat_id
     if chat_id != "me":
@@ -941,10 +958,11 @@ async def handle_transmux_stream(
         "-hide_banner",
         "-loglevel", "error",
         "-threads", "2",
+        "-fflags", "+genpts",
     ]
     if input_target != "pipe:0":
         if ss > 0:
-            cmd.extend(["-ss", str(ss)])
+            cmd.extend(["-ss", str(ss), "-accurate_seek"])
         cmd.extend(["-i", input_target])
     else:
         cmd.extend(["-i", "pipe:0"])
@@ -959,6 +977,7 @@ async def handle_transmux_stream(
         "-b:a", "192k",
         "-ac", "2",
         "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "1024",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-frag_duration", "500000",
         "-f", "mp4",
@@ -989,25 +1008,36 @@ async def handle_transmux_stream(
             pass
 
     stderr_task = asyncio.create_task(log_stderr())
+    transmux_stop_event = asyncio.Event()
+    tenant_id = str(tenant_user_id or "default")
+    account_id = str(getattr(grant, "account_id", None) or "default")
 
-    # Feeder task: downloads from Telegram in 128KB chunks and pipes to proc.stdin
+    # Feeder task: streams from Telegram via SFASE/Rust engine with media-player priority and pipes to proc.stdin
     async def feed_stdin():
         if input_target != "pipe:0" or not proc.stdin:
             return
+        gen = None
         try:
             total_fed = 0
             total_file_size = file_size if file_size else 0
-            async for chunk in stream_engine.stream_media(
+            gen = stream_engine.stream_media(
                 client=client,
                 chat_id=str(chat_id),
                 message_id=message_id,
                 start=0,
                 length=total_file_size,
                 file_size=total_file_size,
+                is_media_player=True,
                 clean_name=clean_name,
                 message=message,
-            ):
-                if not chunk or proc.returncode is not None:
+                get_fresh_message_fn=get_streamable_message,
+                external_stop_event=transmux_stop_event,
+                tenant_id=tenant_id,
+                account_id=account_id,
+                t_admission=t_admission,
+            )
+            async for chunk in gen:
+                if not chunk or transmux_stop_event.is_set() or proc.returncode is not None:
                     break
                 if proc.stdin and not proc.stdin.is_closing():
                     proc.stdin.write(chunk)
@@ -1022,6 +1052,13 @@ async def handle_transmux_stream(
         except Exception as e:
             logger.warning(f"Feed stdin error: {e}")
         finally:
+            import inspect
+            if gen is not None and hasattr(gen, "aclose"):
+                try:
+                    if inspect.getasyncgenstate(gen) in (inspect.AGEN_CREATED, inspect.AGEN_SUSPENDED):
+                        await gen.aclose()
+                except Exception:
+                    pass
             try:
                 if proc.stdin and not proc.stdin.is_closing():
                     proc.stdin.close()
@@ -1045,6 +1082,7 @@ async def handle_transmux_stream(
         except (ConnectionResetError, ConnectionAbortedError, asyncio.CancelledError, GeneratorExit):
             logger.debug("Transmux stream client disconnected or cancelled")
         finally:
+            transmux_stop_event.set()
             feeder_task.cancel()
             stderr_task.cancel()
             try:
@@ -1091,53 +1129,10 @@ async def probe_media_streams(chat_id: str, message_id: int, request: Request):
         except ValueError:
             clean_chat_id = chat_id
 
-    cache_key = (clean_chat_id, message_id)
+    client, principal, grant, tenant_user_id = await _resolve_streaming_client(request, chat_id, message_id)
+    cache_key = (str(tenant_user_id or "default"), clean_chat_id, message_id)
     if cache_key in _STREAM_PROBE_CACHE:
         return _STREAM_PROBE_CACHE[cache_key]
-
-    # Resolve Tenant Context if v3 session or Playback Grant is present
-    principal = getattr(request.state, "principal", None)
-    grant = getattr(request.state, "grant", None)
-    tenant_user_id = principal.user_id if principal else (grant.user_id if grant else None)
-
-    # Defense-in-depth: enforce playback token validity even if middleware was bypassed
-    grant_token = None
-    try:
-        grant_token = request.query_params.get("grant") or request.query_params.get("playback_token")
-    except Exception:
-        pass
-    if grant_token:
-        is_token_valid = False
-        if grant is not None:
-            is_token_valid = True
-        else:
-            try:
-                from app.services.vlc_playback import playback_grants
-                is_token_valid = playback_grants.allows(
-                    grant_token, chat_id, message_id, tenant_id=tenant_user_id
-                )
-            except Exception:
-                is_token_valid = False
-        if not is_token_valid:
-            raise HTTPException(status_code=403, detail="Forbidden: Playback token is invalid, expired, or revoked.")
-
-    if tenant_user_id:
-        from app.telegram.client_manager import multi_tenant_manager
-        from app.auth_v3.session_service import Principal
-        t_principal = principal or Principal(
-            user_id=grant.user_id,
-            session_id=uuid.uuid4(),
-            device_id=None,
-            role="user",
-            display_name="GrantUser"
-        )
-        client = await multi_tenant_manager.get_client(t_principal, account_id=getattr(grant, "account_id", None))
-        if not client or not client.is_connected():
-            raise HTTPException(status_code=503, detail="Telegram client is not connected.")
-    else:
-        client = await TelegramClientManager.get_client()
-        if not client or not client.is_connected():
-            raise HTTPException(status_code=503, detail="Telegram client is not connected.")
 
     message = sniffer_service._message_cache.get((clean_chat_id, message_id))
     if not message or not getattr(message, "media", None):
@@ -1161,17 +1156,52 @@ async def probe_media_streams(chat_id: str, message_id: int, request: Request):
     if not message or not message.media:
         raise HTTPException(status_code=404, detail="Media not found.")
 
-    # Download initial 2.5MB buffer to probe container streams
-    probe_buffer = bytearray()
-    try:
-        async for chunk in client.iter_download(message.media, request_size=512*1024, chunk_size=512*1024):
-            probe_buffer.extend(chunk)
-            if len(probe_buffer) >= 2500 * 1024:
-                break
-    except Exception as e:
-        logger.debug(f"Probe buffer notice: {e}")
+    # Check local disk cache -> RAM sliding buffer -> stream_engine before raw iter_download
+    file_size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
+    norm_chat_id = StreamSlidingBuffer._canonical_cid(clean_chat_id)
+    cached_file = stream_cache_service.get_cached_file(str(chat_id), message_id, user_id=tenant_user_id)
+    probe_limit = min(file_size, 2000 * 1024) if file_size > 0 else 2000 * 1024
 
-    if not probe_buffer:
+    probe_target = "pipe:0"
+    probe_buffer = bytearray()
+
+    if cached_file and cached_file.exists():
+        probe_target = str(cached_file)
+    else:
+        ram_head = _SLIDING_STREAM_BUFFER.get_slice(norm_chat_id, message_id, 0, min(probe_limit, 1500 * 1024))
+        if ram_head:
+            probe_buffer.extend(ram_head)
+        else:
+            try:
+                async for chunk in stream_engine.stream_media(
+                    client=client,
+                    chat_id=str(clean_chat_id),
+                    message_id=message_id,
+                    start=0,
+                    length=probe_limit,
+                    file_size=file_size,
+                    is_media_player=True,
+                    clean_name=getattr(getattr(message, "file", None), "name", f"probe_{message_id}") or f"probe_{message_id}",
+                    message=message,
+                    tenant_id=str(tenant_user_id or "default"),
+                    account_id=str(getattr(grant, "account_id", None) or "default"),
+                ):
+                    probe_buffer.extend(chunk)
+                    if len(probe_buffer) >= probe_limit:
+                        break
+            except Exception as e:
+                logger.debug(f"Probe stream_engine notice: {e}")
+
+            if not probe_buffer:
+                try:
+                    async for chunk in client.iter_download(message.media, request_size=512*1024, chunk_size=512*1024):
+                        probe_buffer.extend(chunk)
+                        if len(probe_buffer) >= probe_limit:
+                            break
+                except Exception as e:
+                    logger.debug(f"Probe buffer notice: {e}")
+
+    if probe_target == "pipe:0" and not probe_buffer:
         raise HTTPException(status_code=404, detail="Could not read stream headers.")
 
     try:
@@ -1181,15 +1211,15 @@ async def probe_media_streams(chat_id: str, message_id: int, request: Request):
             "-print_format", "json",
             "-show_streams",
             "-show_format",
-            "pipe:0"
+            probe_target
         ]
         proc = await asyncio.create_subprocess_exec(
             *ffprobe_cmd,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if probe_target == "pipe:0" else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout_data, _ = await proc.communicate(input=bytes(probe_buffer))
+        stdout_data, _ = await proc.communicate(input=bytes(probe_buffer) if probe_target == "pipe:0" else None)
         import json
         probe_json = json.loads(stdout_data.decode("utf-8", errors="ignore"))
 
@@ -1409,8 +1439,8 @@ async def get_mobile_playback_info(chat_id: str, message_id: int, request: Reque
 
 @router.get("/api/media/prewarm/{chat_id}/{message_id}", dependencies=[Depends(verify_auth)])
 @router.post("/api/media/prewarm/{chat_id}/{message_id}", dependencies=[Depends(verify_auth)])
-async def prewarm_media_endpoint(chat_id: str, message_id: int):
-    client = await TelegramClientManager.get_client()
+async def prewarm_media_endpoint(chat_id: str, message_id: int, request: Request):
+    client, _principal, _grant, _tenant_id = await _resolve_streaming_client(request, chat_id, message_id)
     clean_chat_id: Union[int, str] = chat_id
     if clean_chat_id != "me":
         try:

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Union, Any, Dict
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from telethon.tl.types import User, Channel, Chat
 from telethon.tl.functions.contacts import GetContactsRequest
 from app.models import ChatItem, AuthStatus
@@ -412,9 +412,17 @@ class SendTextMessageRequest(BaseModel):
     text: str
 
 
+async def _resolve_chat_client(request: Optional[Request] = None):
+    principal = getattr(request.state, "principal", None) if request is not None else None
+    if principal is not None:
+        return await TelegramClientManager.get_client(principal=principal)
+    return await TelegramClientManager.get_client()
+
+
 @router.get("/chats/{chat_id}/messages")
 async def get_chat_messages(
     chat_id: str,
+    request: Request,
     limit: int = Query(35, ge=1, le=100),
     offset_id: int = Query(0, ge=0)
 ):
@@ -423,7 +431,7 @@ async def get_chat_messages(
     Extracts text, media attributes (video/photo/document, size, duration, stream_url),
     and sender information.
     """
-    client = await TelegramClientManager.get_client()
+    client = await _resolve_chat_client(request)
     if not await client.is_user_authorized():
         raise HTTPException(status_code=401, detail="Telegram account not authorized.")
 
@@ -515,9 +523,9 @@ async def get_chat_messages(
 
 
 @router.post("/chats/{chat_id}/send")
-async def send_chat_message(chat_id: str, payload: SendTextMessageRequest):
+async def send_chat_message(chat_id: str, payload: SendTextMessageRequest, request: Request):
     """Sends a text message to the specified Telegram chat/channel."""
-    client = await TelegramClientManager.get_client()
+    client = await _resolve_chat_client(request)
     if not await client.is_user_authorized():
         raise HTTPException(status_code=401, detail="Telegram account not authorized.")
 

@@ -99,7 +99,7 @@ def test_layout_dock_proportions_and_no_overflow_1024_to_1920(browser_context):
         right_w = data["rightRect"]["width"]
         cat_w = data["catRect"]["width"]
 
-        assert 185 <= left_w <= 265, f"Left dock width {left_w}px outside [190px, 260px] (+tolerance) at {width}px"
+        assert 235 <= left_w <= 365, f"Left dock width {left_w}px outside [240px, 360px] (+tolerance) at {width}px"
         assert 185 <= right_w <= 265, f"Right dock width {right_w}px outside [190px, 260px] (+tolerance) at {width}px"
         assert cat_w > 400, f"Center catalog width {cat_w}px squished below 400px at {width}px"
 

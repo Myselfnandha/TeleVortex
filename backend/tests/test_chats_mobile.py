@@ -211,3 +211,52 @@ async def test_list_chats_telegram_ordering_and_contact_separation():
             assert len(contact_items) == 1
             assert contact_items[0]["type"] == "contact"
             assert contact_items[0]["is_contact"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_dock_multi_tenant_principal_forwarding():
+    from types import SimpleNamespace
+    from app.routes.chats import _resolve_chat_client
+
+    fake_principal = SimpleNamespace(user_id="tenant-1")
+    fake_request = SimpleNamespace(state=SimpleNamespace(principal=fake_principal))
+
+    with patch("app.telegram_client.TelegramClientManager.get_client", new_callable=AsyncMock) as mock_get_client:
+        mock_get_client.return_value = "tenant_client"
+        client = await _resolve_chat_client(fake_request)
+        assert client == "tenant_client"
+        mock_get_client.assert_awaited_once_with(principal=fake_principal)
+
+    with patch("app.telegram_client.TelegramClientManager.get_client", new_callable=AsyncMock) as mock_get_client:
+        mock_get_client.return_value = "default_client"
+        client = await _resolve_chat_client(SimpleNamespace(state=SimpleNamespace()))
+        assert client == "default_client"
+        mock_get_client.assert_awaited_once_with()
+
+
+def test_telegram_integrated_into_chat_dock_contract():
+    root = Path(__file__).resolve().parent.parent.parent
+    tg_dock = root / "frontend-reui" / "src" / "components" / "DockedTelegramChat.tsx"
+    channel_dock = root / "frontend-reui" / "src" / "components" / "DockedChannelPicker.tsx"
+    cinema_view = root / "frontend-reui" / "src" / "views" / "CinemaView.tsx"
+
+    assert tg_dock.exists()
+    tg_src = tg_dock.read_text(encoding="utf-8")
+    assert "api.getChatMessages" in tg_src
+    assert "api.sendChatMessage" in tg_src
+    assert "onPlayVideo" in tg_src
+    assert "onPlayVlc" in tg_src
+
+    picker_src = channel_dock.read_text(encoding="utf-8")
+    assert "DockedTelegramChat" in picker_src
+    assert "/api/tgweb/" not in picker_src
+    assert "TG Web" not in picker_src
+    assert 'role="tablist"' not in picker_src
+    assert "w-[26%]" in picker_src
+    assert "min-w-[240px]" in picker_src
+    assert "max-w-[360px]" in picker_src
+    assert "cinema_channel_dock_width" in picker_src
+
+    cinema_src = cinema_view.read_text(encoding="utf-8")
+    assert "onPlayVideo={handleStartPlay}" in cinema_src
+    assert "onPlayVlc={handlePlayInVlc}" in cinema_src

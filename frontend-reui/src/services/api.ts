@@ -310,20 +310,25 @@ class ApiService {
     );
   }
 
-  async updatePlaybackProgress(payload: {
-    chat_id: string | number;
-    message_id: number;
-    filename: string;
-    position_seconds: number;
-    duration_seconds: number;
-    thumbnail_url?: string;
-    last_chunk_index?: number;
-    last_byte_offset?: number;
-  }): Promise<any> {
+  async updatePlaybackProgress(
+    payload: {
+      chat_id: string | number;
+      message_id: number;
+      filename: string;
+      position_seconds: number;
+      duration_seconds: number;
+      file_size?: number;
+      thumbnail_url?: string;
+      last_chunk_index?: number;
+      last_byte_offset?: number;
+    },
+    keepalive: boolean = false
+  ): Promise<any> {
     return this.request('/api/media/playback_progress', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      keepalive,
     });
   }
 
@@ -482,6 +487,15 @@ class ApiService {
 
   async prewarmMedia(chatId: string | number, messageId: number): Promise<{ status: string }> {
     return this.request(`/api/media/prewarm/${encodeURIComponent(String(chatId))}/${messageId}`);
+  }
+
+  async probeMediaStreams(chatId: string | number, messageId: number): Promise<{
+    chat_id: string;
+    message_id: number;
+    audio_tracks: { index: number; stream_index?: number; language?: string; title: string; codec?: string; channels?: number }[];
+    subtitle_tracks: { index: number; stream_index?: number; language?: string; title: string; codec?: string; vtt_url: string }[];
+  }> {
+    return this.request(`/api/media/streams/${encodeURIComponent(String(chatId))}/${messageId}`);
   }
 
   async getContinueWatching(): Promise<ContinueWatchingItem[]> {

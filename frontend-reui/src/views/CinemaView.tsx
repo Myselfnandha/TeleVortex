@@ -46,11 +46,14 @@ import {
   MessageSquare,
   Minimize2,
   MoreVertical,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   PlayCircle,
   QrCode,
   RefreshCw,
   Search,
+  Send,
   SlidersHorizontal,
   Tv,
 } from 'lucide-react';
@@ -147,13 +150,47 @@ export const CinemaView: React.FC = () => {
   const isDesktopLayout = useMediaQuery('(min-width: 1024px)');
   const isMobileDrawerActive = !isDesktopLayout && (isChannelDockOpen || isContinueWatchingOpen);
 
-  const handleOpenChannelDock = () => {
+  const handleOpenChannelDock = useCallback(() => {
     if (!isDesktopLayout) {
       setContinueWatchingOpen(false);
     }
     setChannelDockOpen(true);
     localStorage.setItem('cinema_channel_dock_open', 'true');
-  };
+  }, [isDesktopLayout]);
+
+  const handleCloseChannelDock = useCallback(() => {
+    setChannelDockOpen(false);
+    localStorage.setItem('cinema_channel_dock_open', 'false');
+  }, []);
+
+  const handleToggleChannelDock = useCallback(() => {
+    setChannelDockOpen((prev) => {
+      const next = !prev;
+      if (next && !isDesktopLayout) {
+        setContinueWatchingOpen(false);
+      }
+      localStorage.setItem('cinema_channel_dock_open', String(next));
+      return next;
+    });
+  }, [isDesktopLayout]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b') {
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+        ) {
+          return;
+        }
+        e.preventDefault();
+        handleToggleChannelDock();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleToggleChannelDock]);
 
   const handleOpenContinueWatching = () => {
     if (!isDesktopLayout) {
@@ -309,8 +346,13 @@ export const CinemaView: React.FC = () => {
       }
     });
 
+    const unsubResume = socketService.onContinueWatchingUpdate(() => {
+      void loadContinueWatching();
+    });
+
     return () => {
       unsubCinema();
+      unsubResume();
     };
   }, [selectedChat.id]);
 
@@ -935,10 +977,29 @@ export const CinemaView: React.FC = () => {
   const watchProgressMap = useMemo(() => {
     const map = new Map<string, ContinueWatchingItem>();
     continueWatching.forEach((item) => {
-      map.set(`${item.chat_id}_${item.message_id}`, item);
+      const rawCid = String(item.chat_id).trim();
+      const normCid = rawCid.replace(/^-100/, '').replace(/^-/, '');
+      map.set(`${rawCid}_${item.message_id}`, item);
+      if (normCid) {
+        map.set(`${normCid}_${item.message_id}`, item);
+        map.set(`-100${normCid}_${item.message_id}`, item);
+      }
     });
     return map;
   }, [continueWatching]);
+
+  const getWatchProgress = useCallback(
+    (chatId: string | number, messageId: number): ContinueWatchingItem | undefined => {
+      const rawCid = String(chatId).trim();
+      const normCid = rawCid.replace(/^-100/, '').replace(/^-/, '');
+      return (
+        watchProgressMap.get(`${rawCid}_${messageId}`) ||
+        watchProgressMap.get(`${normCid}_${messageId}`) ||
+        watchProgressMap.get(`-100${normCid}_${messageId}`)
+      );
+    },
+    [watchProgressMap]
+  );
 
   const handleStartPlay = useCallback((v: CinemaVideo, forceBrowser: boolean = false) => {
     const playerPref = localStorage.getItem('tg_player_pref') || 'vlc';
@@ -946,7 +1007,7 @@ export const CinemaView: React.FC = () => {
       void handlePlayInVlc(v);
       return;
     }
-    const prog = watchProgressMap.get(`${v.chat_id}_${v.message_id}`);
+    const prog = getWatchProgress(v.chat_id, v.message_id);
     const resumeSec = prog ? (prog.playback_seconds || prog.last_position_seconds || 0) : (v.playback_seconds || 0);
     setPreviewVideo({
       ...v,
@@ -954,7 +1015,7 @@ export const CinemaView: React.FC = () => {
       last_chunk_index: prog?.last_chunk_index,
       last_byte_offset: prog?.last_byte_offset,
     });
-  }, [previewVideo, watchProgressMap]);
+  }, [previewVideo, getWatchProgress]);
 
   const activePlaylist: CinemaVideo[] = useMemo(() => {
     if (!previewVideo) return [];
@@ -1039,6 +1100,27 @@ export const CinemaView: React.FC = () => {
         {/* Row 1: Brand & Channel Title on Left, Controls (Sort, Search, Sync) on Right */}
         <div className="flex items-center justify-between gap-2 min-h-[38px] flex-nowrap">
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleToggleChannelDock}
+              aria-expanded={isChannelDockOpen}
+              aria-controls="telegram-chat-dock"
+              aria-label={isChannelDockOpen ? 'Close Telegram Chat Dock' : 'Open Telegram Chat Dock'}
+              title={`${isChannelDockOpen ? 'Close' : 'Open'} Telegram Chat Dock (Ctrl+B)`}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 min-h-[36px] rounded-lg border text-xs font-semibold transition-all cursor-pointer shrink-0 ${
+                isChannelDockOpen
+                  ? 'border-sky-500/40 bg-sky-500/15 text-sky-400 hover:bg-sky-500/25 shadow-2xs'
+                  : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground hover:bg-muted/70 hover:border-sky-500/40'
+              }`}
+            >
+              {isChannelDockOpen ? (
+                <PanelLeftClose className="w-3.5 h-3.5 shrink-0" />
+              ) : (
+                <PanelLeftOpen className="w-3.5 h-3.5 shrink-0" />
+              )}
+              <span className="hidden sm:inline">{isChannelDockOpen ? 'Hide Dock' : 'Telegram'}</span>
+            </button>
+
             <div className="flex items-center gap-1.5 shrink-0">
               <div className="w-7 h-7 rounded-lg bg-primary/10 text-primary flex items-center justify-center shrink-0 shadow-inner">
                 <Clapperboard className="w-3.5 h-3.5" />
@@ -1053,13 +1135,10 @@ export const CinemaView: React.FC = () => {
             </div>
 
             <button
-              onClick={() => {
-                if (!isChannelDockOpen) {
-                  handleOpenChannelDock();
-                }
-              }}
+              type="button"
+              onClick={handleToggleChannelDock}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] rounded-full border border-border/80 bg-muted/40 hover:bg-muted/70 hover:border-primary/50 transition-all text-xs font-semibold text-foreground shadow-2xs cursor-pointer max-w-[160px] sm:max-w-[220px] lg:max-w-[280px] group shrink-0"
-              title="Click to view channels & chats"
+              title={`${isChannelDockOpen ? 'Close' : 'Open'} Telegram Chat Dock (Ctrl+B)`}
             >
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
               <Hash className="w-3.5 h-3.5 text-primary shrink-0" />
@@ -1259,25 +1338,32 @@ export const CinemaView: React.FC = () => {
 
       {/* Main Layout Area: Docked Left Channels, Center Scrolling Files Catalog, Docked Right Continue Watching */}
       <div className="flex-1 min-h-0 flex flex-row gap-2 sm:gap-2.5 items-stretch w-full overflow-hidden relative">
-        {/* Left Side Docked Channel Picker */}
+        {/* Left Side Docked Telegram Chat Picker */}
         {isChannelDockOpen ? (
           <DockedChannelPicker
+            selectedChat={selectedChat}
             selectedChatId={selectedChat.id}
             onSelect={setSelectedChat}
-            onClose={() => {
-              setChannelDockOpen(false);
-              localStorage.setItem('cinema_channel_dock_open', 'false');
-            }}
+            onPlayVideo={handleStartPlay}
+            onPlayVlc={handlePlayInVlc}
+            onClose={handleCloseChannelDock}
           />
         ) : (
           <div className="shrink-0 flex items-center h-full">
             <button
+              type="button"
               onClick={handleOpenChannelDock}
-              className="h-28 w-5 sm:w-6 flex flex-col items-center justify-center rounded-r-xl border border-l-0 border-border/70 bg-card/90 hover:bg-card hover:border-primary/50 text-muted-foreground hover:text-foreground shadow-md transition-all cursor-pointer group z-20"
-              title="Open Channels & Chats Sidebar"
+              className="py-3 w-8 sm:w-9 flex flex-col items-center justify-center gap-2 rounded-r-xl border border-l-0 border-border/80 bg-card/95 hover:bg-sky-500/10 hover:border-sky-500/50 text-muted-foreground hover:text-foreground shadow-md transition-all cursor-pointer group z-20"
+              title="Open Telegram Chat Dock (Ctrl+B)"
               aria-label="Open Channels & Chats Sidebar"
             >
-              <ChevronRight className="w-4 h-4 text-primary group-hover:scale-110 transition-transform" />
+              <PanelLeftOpen className="w-4 h-4 text-sky-400 group-hover:scale-110 transition-transform" />
+              <div className="w-5 h-5 rounded-md bg-sky-500/15 text-sky-400 flex items-center justify-center">
+                <Send className="w-3 h-3" />
+              </div>
+              <span className="text-[10px] font-semibold tracking-wider uppercase [writing-mode:vertical-rl] rotate-180 text-muted-foreground group-hover:text-sky-400">
+                Telegram
+              </span>
             </button>
           </div>
         )}
@@ -2744,7 +2830,7 @@ export const CinemaView: React.FC = () => {
                       </div>
 
                       {(() => {
-                        const cardProg = watchProgressMap.get(`${video.chat_id}_${video.message_id}`);
+                        const cardProg = getWatchProgress(video.chat_id, video.message_id);
                         const cardPct = cardProg ? (cardProg.percent !== undefined ? cardProg.percent : (cardProg.progress_percent !== undefined ? Math.round(cardProg.progress_percent) : 0)) : 0;
                         if (cardPct <= 0) return null;
                         const progressColor = cardPct >= 80 ? 'bg-emerald-400' : cardPct >= 40 ? 'bg-amber-400' : 'bg-sky-400';

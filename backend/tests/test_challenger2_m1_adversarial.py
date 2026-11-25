@@ -99,11 +99,25 @@ def test_dock_breakpoint_boundary_1023_vs_1024(browser_context):
     assert data_1024["docW"] <= data_1024["winW"] + 1
     assert data_1024["leftPos"] == "static"
     assert data_1024["rightPos"] == "static"
-    assert 185 <= data_1024["lRect"]["width"] <= 265
+    assert 235 <= data_1024["lRect"]["width"] <= 365
     assert 185 <= data_1024["rRect"]["width"] <= 265
     assert data_1024["cRect"]["width"] >= 480
     assert data_1024["lRect"]["right"] <= data_1024["cRect"]["left"] + 2
     assert data_1024["cRect"]["right"] <= data_1024["rRect"]["left"] + 2
+
+    # Verify engineered dock close/open toggle round-trip
+    page.click('aside#telegram-chat-dock button[aria-label="Close channels sidebar"]')
+    page.wait_for_selector('button[aria-label="Open Channels & Chats Sidebar"]', timeout=3000)
+    assert page.locator('aside#telegram-chat-dock').count() == 0
+
+    page.click('button[aria-label="Open Channels & Chats Sidebar"]')
+    page.wait_for_selector('aside#telegram-chat-dock', timeout=3000)
+    assert page.locator('aside#telegram-chat-dock').count() == 1
+
+    page.click('button[aria-controls="telegram-chat-dock"]')
+    page.wait_for_selector('button[aria-label="Open Channels & Chats Sidebar"]', timeout=3000)
+    page.click('button[aria-controls="telegram-chat-dock"]')
+    page.wait_for_selector('aside#telegram-chat-dock', timeout=3000)
 
     page.close()
 
@@ -135,9 +149,9 @@ def test_dock_upper_bound_at_ultra_wide_viewports(browser_context):
         }""")
 
         assert widths["docWidth"] <= widths["winWidth"] + 1
-        assert widths["leftWidth"] <= 265
+        assert widths["leftWidth"] <= 365
         assert widths["rightWidth"] <= 265
-        assert widths["catWidth"] > (width - 600)
+        assert widths["catWidth"] > (width - 680)
 
     page.close()
 

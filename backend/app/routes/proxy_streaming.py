@@ -246,7 +246,7 @@ async def prewarm_media_stream(client, chat_id: Union[str, int], message_id: int
         if file_size <= 0:
             return
 
-        norm_chat_id = str(clean_chat_id).lstrip("-").replace("100", "", 1)
+        norm_chat_id = StreamSlidingBuffer._canonical_cid(clean_chat_id)
         media_key = (norm_chat_id, message_id)
 
         # 1. Prewarm head buffer (first 1MB)
@@ -444,7 +444,7 @@ async def handle_proxy_download(
         return err_resp
 
     length = int(end - start + 1)
-    norm_chat_id = str(clean_chat_id).lstrip("-").replace("100", "", 1)
+    norm_chat_id = StreamSlidingBuffer._canonical_cid(clean_chat_id)
     media_key = (norm_chat_id, message_id)
     user_agent = request.headers.get("User-Agent", "")
     ua_lower = user_agent.lower()
@@ -600,7 +600,7 @@ async def handle_proxy_download(
                 slice_offset = start - tail_offset
                 avail = len(tail_data) - slice_offset
                 slice_len = min(length, avail)
-                if slice_len > 0:
+                if slice_len == length:
                     probe_slice = bytes(tail_data[slice_offset:slice_offset + slice_len])
                     logger.info(f"STREAM [{clean_name}] Direct tail RAM hit: {len(probe_slice):,}B at offset {start:,} (0ms TTFB)")
                     return Response(content=probe_slice, status_code=status_code, headers=headers)
@@ -988,7 +988,7 @@ async def handle_transmux_stream(
         except Exception:
             pass
 
-    asyncio.create_task(log_stderr())
+    stderr_task = asyncio.create_task(log_stderr())
 
     # Feeder task: downloads from Telegram in 128KB chunks and pipes to proc.stdin
     async def feed_stdin():
@@ -1046,14 +1046,19 @@ async def handle_transmux_stream(
             logger.debug("Transmux stream client disconnected or cancelled")
         finally:
             feeder_task.cancel()
+            stderr_task.cancel()
             try:
                 await feeder_task
             except (asyncio.CancelledError, Exception):
                 pass
             try:
+                await stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
                 if proc.returncode is None:
                     proc.kill()
-                    await asyncio.shield(proc.wait())
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2.0)
             except Exception:
                 pass
 

@@ -57,6 +57,7 @@ export interface DeviceAuthStatus {
   authenticated: boolean;
   is_loopback: boolean;
   has_token_configured: boolean;
+  has_v3_session?: boolean;
 }
 
 export interface SecondaryAuthStatus {

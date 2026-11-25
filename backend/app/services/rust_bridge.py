@@ -48,6 +48,7 @@ class RustBridge:
         self._consecutive_failures: int = 0
         self._circuit_broken_until: float = 0.0
         self._log_file = None
+        self._register_task: Optional[asyncio.Task] = None
         self.chunks_requested: int = 0
         self.chunks_completed: int = 0
         self.chunks_cancelled: int = 0
@@ -83,11 +84,19 @@ class RustBridge:
         }
 
     def trip_circuit(self, cooldown_seconds: float = 30.0):
-        self._circuit_broken_until = max(self._circuit_broken_until, time.time() + cooldown_seconds)
+        self._circuit_broken_until = max(self._circuit_broken_until, time.monotonic() + cooldown_seconds)
 
     def reset_circuit(self):
         self._circuit_broken_until = 0.0
         self._consecutive_failures = 0
+
+    def _schedule_session_registration(self):
+        if self._register_task and not self._register_task.done():
+            return
+        try:
+            self._register_task = asyncio.create_task(self.ensure_sessions_registered())
+        except RuntimeError:
+            pass
 
     def _get_client(self) -> httpx.AsyncClient:
         try:
@@ -100,6 +109,14 @@ class RustBridge:
                 self._client_loop = current_loop
             if self._client_loop == current_loop:
                 return self._client
+            # Close stale client cleanly when event loop changed to avoid socket leaks
+            old_client = self._client
+            old_loop = getattr(self, "_client_loop", None)
+            if old_loop and not old_loop.is_closed():
+                try:
+                    old_loop.call_soon_threadsafe(lambda: old_loop.create_task(old_client.aclose()))
+                except Exception:
+                    pass
 
         headers = {"Authorization": f"Bearer {_RUST_CORE_AUTH_TOKEN}"}
         self._client = httpx.AsyncClient(
@@ -123,7 +140,7 @@ class RustBridge:
         return None
 
     async def is_healthy(self) -> bool:
-        now = time.time()
+        now = time.monotonic()
         if now < getattr(self, "_circuit_broken_until", 0.0):
             return False
         if (now - getattr(self, "_last_health_time", 0.0)) < 2.0:
@@ -136,7 +153,7 @@ class RustBridge:
                 active = data.get("active_accounts", 0)
                 ok = data.get("status") == "ok" and active > 0
                 if data.get("status") == "ok" and active == 0:
-                    asyncio.create_task(self.ensure_sessions_registered())
+                    self._schedule_session_registration()
                 self._cached_healthy = ok
                 self._last_health_time = now
                 return ok
@@ -222,6 +239,12 @@ class RustBridge:
                     except Exception:
                         pass
                 self._process = None
+            if self._log_file and not self._log_file.closed:
+                try:
+                    self._log_file.close()
+                except Exception:
+                    pass
+                self._log_file = None
 
     async def register_session(self, session_string: str, api_id: int, account_idx: Optional[int] = None) -> bool:
         if not session_string or not api_id:
@@ -336,7 +359,7 @@ class RustBridge:
         priority: str = "high",
         account_idx: Optional[int] = None
     ) -> Optional[bytes]:
-        now = time.time()
+        now = time.monotonic()
         if now < getattr(self, "_circuit_broken_until", 0.0):
             return None
 
@@ -394,7 +417,7 @@ class RustBridge:
                     if now >= getattr(self, "_circuit_broken_until", 0.0):
                         self.trip_circuit(3.0)
                         logger.warning(f"Rust bridge circuit tripped for 3s due to {self._consecutive_failures} consecutive errors ({resp.status_code})")
-                        asyncio.create_task(self.ensure_sessions_registered())
+                        self._schedule_session_registration()
             logger.warning(f"Rust stream_chunk failed: {resp.status_code} {err_text}")
         except asyncio.CancelledError:
             self.chunks_cancelled += 1
@@ -416,7 +439,7 @@ class RustBridge:
                 if now >= getattr(self, "_circuit_broken_until", 0.0):
                     self.trip_circuit(3.0)
                     logger.warning(f"Rust bridge circuit tripped for 3s due to {self._consecutive_failures} consecutive failures ({type(e).__name__})")
-                    asyncio.create_task(self.ensure_sessions_registered())
+                    self._schedule_session_registration()
             logger.warning(f"Rust stream_chunk error: {type(e).__name__} ({e or 'timeout'})")
         return None
 

@@ -229,7 +229,7 @@ impl StreamEngine {
         if !self.authed_dcs.read().await.contains(&(account_idx, dc_id)) {
             let _guard = self.auth_lock.lock().await;
             if !self.authed_dcs.read().await.contains(&(account_idx, dc_id)) {
-                let _ = self.copy_auth_to_dc(client, dc_id, account_idx).await;
+                self.copy_auth_to_dc(client, dc_id, account_idx).await?;
                 self.authed_dcs.write().await.insert((account_idx, dc_id));
             }
         }

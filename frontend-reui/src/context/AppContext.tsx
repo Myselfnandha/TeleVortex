@@ -206,22 +206,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const refreshV3User = async () => {
     try {
-      const me = await api.v3GetMe();
-      setV3User(me);
-      setIsLocalNoAuth(false);
-      await refreshAuth();
-    } catch {
-      setV3User(null);
-      try {
-        const devStatus = await api.getDeviceAuthStatus();
-        if (devStatus.is_loopback && !devStatus.auth_required && devStatus.authenticated) {
-          setIsLocalNoAuth(true);
-          await refreshAuth();
-        } else {
+      const devStatus = await api.getDeviceAuthStatus();
+      const storedToken = api.getStoredToken();
+      const shouldProbeV3 = Boolean(devStatus.has_v3_session) || storedToken.length === 64;
+
+      if (shouldProbeV3) {
+        try {
+          const me = await api.v3GetMe();
+          setV3User(me);
           setIsLocalNoAuth(false);
-          setAuthStatus({ authenticated: false });
+          await refreshAuth();
+          return;
+        } catch {
+          setV3User(null);
         }
+      } else {
+        setV3User(null);
+      }
+
+      if (devStatus.is_loopback && !devStatus.auth_required && devStatus.authenticated) {
+        setIsLocalNoAuth(true);
+        await refreshAuth();
+      } else {
+        setIsLocalNoAuth(false);
+        setAuthStatus({ authenticated: false });
+      }
+    } catch {
+      // Fallback to direct v3 check if device status endpoint is temporarily unreachable
+      try {
+        const me = await api.v3GetMe();
+        setV3User(me);
+        setIsLocalNoAuth(false);
+        await refreshAuth();
       } catch {
+        setV3User(null);
         setIsLocalNoAuth(false);
         setAuthStatus({ authenticated: false });
       }

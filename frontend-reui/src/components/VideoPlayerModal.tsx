@@ -109,11 +109,26 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     : '';
   const displayName = video ? cleanFileName(video.filename) : '';
 
-  const showOsd = (msg: string) => {
+  const showOsd = useCallback((msg: string) => {
     setOsdMessage(msg);
     if (osdTimerRef.current) clearTimeout(osdTimerRef.current);
     osdTimerRef.current = setTimeout(() => setOsdMessage(null), 1500);
-  };
+  }, []);
+
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const handleFsChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFsChange);
+      if (osdTimerRef.current) clearTimeout(osdTimerRef.current);
+      if (seekDebounceRef.current) clearTimeout(seekDebounceRef.current);
+      dragCleanupRef.current?.();
+    };
+  }, []);
 
   // Reset state when video changes
   useEffect(() => {
@@ -377,16 +392,25 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     };
 
+    const cleanupDrag = () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      if (dragCleanupRef.current === cleanupDrag) {
+        dragCleanupRef.current = null;
+      }
+    };
+
     const onMouseUp = (upEvent: MouseEvent) => {
       if (isDraggingTimeline.current) {
         isDraggingTimeline.current = false;
         const finalTarget = calculateTimelineTime(upEvent.clientX);
         handleSeek(finalTarget);
       }
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
+      cleanupDrag();
     };
 
+    dragCleanupRef.current?.();
+    dragCleanupRef.current = cleanupDrag;
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
   };
@@ -613,6 +637,9 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   const handleDialogChange = (isOpen: boolean) => {
     if (!isOpen) {
       if (seekDebounceRef.current) clearTimeout(seekDebounceRef.current);
+      if (osdTimerRef.current) clearTimeout(osdTimerRef.current);
+      dragCleanupRef.current?.();
+      isDraggingTimeline.current = false;
       if (videoRef.current) {
         syncProgress(Math.floor(currentTimeSec));
         try {
@@ -987,7 +1014,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             </button>
 
             <a
-              href={`/dl/${encodeURIComponent(String(video.chat_id))}/${video.message_id}/${encodeURIComponent(video.filename)}`}
+              href={`/dl/${encodeURIComponent(String(video.chat_id))}/${video.message_id}/${encodeURIComponent(video.filename)}${api.getStoredToken() ? `?token=${encodeURIComponent(api.getStoredToken())}` : ''}`}
               download={video.filename}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-zinc-900 border border-white/10 hover:bg-zinc-800 text-zinc-300 hover:text-white transition-colors cursor-pointer text-xs"
               title="Download file directly"

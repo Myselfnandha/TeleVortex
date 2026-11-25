@@ -533,9 +533,12 @@ class StreamEngine:
                                         task_obj.metrics.t_rust_wire_ms = t_wire_ms
                                         task_obj.metrics.t_wire_ms = t_wire_ms
                                 stream_buffer.push(norm_cid, message_id, target_offset, rust_data)
+                                stream_cache_service.put_slice(norm_cid, message_id, target_offset, rust_data)
+                                if (orig_cid, orig_mid) != (norm_cid, message_id):
+                                    stream_buffer.push(orig_cid, orig_mid, target_offset, rust_data)
+                                    stream_cache_service.put_slice(orig_cid, orig_mid, target_offset, rust_data)
                                 if file_size > 0 and target_offset >= (file_size - 4 * 1024 * 1024):
                                     stream_buffer.push_tail(norm_cid, message_id, target_offset, rust_data)
-                                stream_cache_service.put_slice(norm_cid, message_id, target_offset, rust_data)
                                 return rust_data
 
                             if len(active_clients) > 1 and not is_saved_messages:

@@ -41,7 +41,8 @@ async def get_device_auth_status(request: Request):
         "auth_required": must_auth,
         "authenticated": is_authed if must_auth else True,
         "is_loopback": is_loopback,
-        "has_token_configured": bool(API_AUTH_TOKEN)
+        "has_token_configured": bool(API_AUTH_TOKEN),
+        "has_v3_session": bool(request.cookies.get("tg_session")),
     }
 
 

@@ -1,6 +1,12 @@
+import asyncio
+import uuid
 import pytest
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from sqlalchemy import select
+from app.db.session import get_sessionmaker
+from app.db.models.user import AppUser
+from app.auth_v3.session_service import SessionService
 
 pytestmark = pytest.mark.playwright
 
@@ -8,13 +14,38 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 FRONTEND_DIR = ROOT_DIR / "frontend-reui"
 BASE_URL = "http://localhost:8088"
 
+async def _create_test_session():
+    sm = get_sessionmaker()
+    async with sm() as session:
+        res = await session.execute(select(AppUser).limit(1))
+        user = res.scalar_one_or_none()
+        if not user:
+            return None, None, None
+        raw_token, sess = await SessionService.create_session(session, user.id)
+        await session.commit()
+        return raw_token, str(sess.id), str(user.id)
+
+async def _revoke_test_session(sess_id: str, user_id: str):
+    sm = get_sessionmaker()
+    async with sm() as session:
+        await SessionService.revoke_session(session, uuid.UUID(sess_id), uuid.UUID(user_id))
+        await session.commit()
+
 @pytest.fixture(scope="module")
 def browser_context():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        yield context
-        browser.close()
+    raw_token, sess_id, user_id = asyncio.run(_create_test_session())
+    if not raw_token:
+        pytest.skip("No AppUser found in database for Playwright session")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            context.add_cookies([{"name": "tg_session", "value": raw_token, "url": BASE_URL}])
+            yield context
+            browser.close()
+    finally:
+        if sess_id and user_id:
+            asyncio.run(_revoke_test_session(sess_id, user_id))
 
 def test_layout_dock_proportions_and_no_overflow_1024_to_1920(browser_context):
     page = browser_context.new_page()

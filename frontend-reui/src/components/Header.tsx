@@ -29,6 +29,7 @@ export const Header: React.FC = () => {
     toggleTheme,
     uploadQueue,
     v3User,
+    isLocalNoAuth,
     setMultiTenantModalOpen,
     refreshV3User,
   } = useApp();
@@ -288,7 +289,7 @@ export const Header: React.FC = () => {
             )}
           </Button>
 
-          {/* v3 Identity Account Pill or Sign In Button */}
+          {/* v3 Identity Account Pill (hidden in local loopback no-auth mode unless user signed in) */}
           {v3User ? (
             <div className="flex items-center gap-1.5 pl-2.5 py-1 pr-1 rounded-xl border border-border/60 bg-muted/40 text-xs shadow-xs">
               <User className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
@@ -315,7 +316,7 @@ export const Header: React.FC = () => {
                 <LogOut className="w-3.5 h-3.5" />
               </button>
             </div>
-          ) : (
+          ) : !isLocalNoAuth ? (
             <button
               onClick={() => setMultiTenantModalOpen(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-primary/40 text-primary hover:bg-primary/10 text-xs font-medium transition-all cursor-pointer shadow-xs"
@@ -323,10 +324,10 @@ export const Header: React.FC = () => {
               <User className="w-3.5 h-3.5" />
               <span>Sign In</span>
             </button>
-          )}
+          ) : null}
 
-          {/* Telegram MTProto Auth Status Button (Visible when logged into v3) */}
-          {v3User && (
+          {/* Telegram MTProto Auth Status Button (Visible when logged into v3 or local loopback mode) */}
+          {(v3User || isLocalNoAuth) && (
             <button
               onClick={() => setAuthModalOpen(true)}
               aria-label={

@@ -37,16 +37,18 @@ const MainLayout: React.FC = () => {
     activeTab,
     theme,
     v3User,
+    isLocalNoAuth,
     isMultiTenantModalOpen,
     setMultiTenantModalOpen,
     refreshV3User,
     isAuthLoading,
   } = useApp();
   const [isDeviceGateOpen, setIsDeviceGateOpen] = useState(false);
+  const hasWorkspaceAccess = Boolean(v3User) || isLocalNoAuth;
 
   useEffect(() => {
-    // If authenticated with v3, legacy device gate is never needed
-    if (v3User) {
+    // If authenticated with v3 or running in authorized local loopback mode, legacy device gate is not needed
+    if (v3User || isLocalNoAuth) {
       setIsDeviceGateOpen(false);
       return;
     }
@@ -80,7 +82,7 @@ const MainLayout: React.FC = () => {
 
     // 2. Listen for 401s across the application only for non-v3
     const unsubAuth = api.onAuthRequired(() => {
-      if (!v3User) {
+      if (!v3User && !isLocalNoAuth) {
         setIsDeviceGateOpen(true);
       }
     });
@@ -88,7 +90,7 @@ const MainLayout: React.FC = () => {
     return () => {
       unsubAuth();
     };
-  }, [v3User]);
+  }, [v3User, isLocalNoAuth]);
 
   if (isAuthLoading) {
     return (
@@ -130,7 +132,7 @@ const MainLayout: React.FC = () => {
           aria-label="Main Workspace Content"
           className="flex-1 min-h-0 min-w-0 w-full relative focus:outline-none flex flex-col overflow-hidden"
         >
-          {!v3User ? (
+          {!hasWorkspaceAccess ? (
             <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-4 text-center p-6 animate-in fade-in">
               <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shadow-lg shadow-primary/5">
                 <ShieldCheck className="w-7 h-7" />
@@ -183,8 +185,8 @@ const MainLayout: React.FC = () => {
       </div>
 
       <MultiTenantAuthModal
-        isOpen={!v3User || isMultiTenantModalOpen}
-        canClose={Boolean(v3User)}
+        isOpen={!hasWorkspaceAccess || isMultiTenantModalOpen}
+        canClose={hasWorkspaceAccess}
         onClose={() => setMultiTenantModalOpen(false)}
         onSuccess={async () => {
           await refreshV3User();

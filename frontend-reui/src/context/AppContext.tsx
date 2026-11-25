@@ -19,6 +19,7 @@ interface AppContextValue {
   isAuthModalOpen: boolean;
   setAuthModalOpen: (open: boolean) => void;
   v3User: V3UserProfile | null;
+  isLocalNoAuth: boolean;
   refreshV3User: () => Promise<void>;
   isMultiTenantModalOpen: boolean;
   setMultiTenantModalOpen: (open: boolean) => void;
@@ -189,6 +190,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
 
   const [v3User, setV3User] = useState<V3UserProfile | null>(null);
+  const [isLocalNoAuth, setIsLocalNoAuth] = useState(false);
   const [isMultiTenantModalOpen, setMultiTenantModalOpen] = useState(false);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
 
@@ -206,10 +208,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const me = await api.v3GetMe();
       setV3User(me);
+      setIsLocalNoAuth(false);
       await refreshAuth();
     } catch {
       setV3User(null);
-      setAuthStatus({ authenticated: false });
+      try {
+        const devStatus = await api.getDeviceAuthStatus();
+        if (devStatus.is_loopback && !devStatus.auth_required && devStatus.authenticated) {
+          setIsLocalNoAuth(true);
+          await refreshAuth();
+        } else {
+          setIsLocalNoAuth(false);
+          setAuthStatus({ authenticated: false });
+        }
+      } catch {
+        setIsLocalNoAuth(false);
+        setAuthStatus({ authenticated: false });
+      }
     } finally {
       setIsAuthLoading(false);
     }
@@ -288,6 +303,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isAuthModalOpen,
         setAuthModalOpen,
         v3User,
+        isLocalNoAuth,
         refreshV3User,
         isMultiTenantModalOpen,
         setMultiTenantModalOpen,

@@ -28,7 +28,7 @@ import { TrustedDevicesCard } from '@/components/v3/TrustedDevicesCard';
 import type { SecondaryAuthStatus } from '@/types';
 
 export const SettingsView: React.FC = () => {
-  const { authStatus, setAuthModalOpen, theme, setTheme, addToast } = useApp();
+  const { authStatus, setAuthModalOpen, theme, setTheme, addToast, v3User } = useApp();
   const [preferredPlayer, setPreferredPlayer] = useState<'vlc' | 'web'>(() => {
     const val = localStorage.getItem('tg_player_pref');
     return val === 'web' ? 'web' : 'vlc';
@@ -752,20 +752,24 @@ export const SettingsView: React.FC = () => {
             </div>
           )}
         </div>
-        {/* v3 Multi-Tenant Linked Accounts */}
-        <div className="md:col-span-2">
-          <AccountManagerCard />
-        </div>
+        {v3User && (
+          <>
+            {/* v3 Multi-Tenant Linked Accounts */}
+            <div className="md:col-span-2">
+              <AccountManagerCard />
+            </div>
 
-        {/* v3 Multi-Turbo Acceleration */}
-        <div className="md:col-span-2">
-          <MultiTurboCard />
-        </div>
+            {/* v3 Multi-Turbo Acceleration */}
+            <div className="md:col-span-2">
+              <MultiTurboCard />
+            </div>
 
-        {/* v3 Trusted Devices */}
-        <div className="md:col-span-2">
-          <TrustedDevicesCard />
-        </div>
+            {/* v3 Trusted Devices */}
+            <div className="md:col-span-2">
+              <TrustedDevicesCard />
+            </div>
+          </>
+        )}
       </div>
 
       <SecondaryAuthModal

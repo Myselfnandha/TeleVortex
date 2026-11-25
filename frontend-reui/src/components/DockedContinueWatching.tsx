@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import type { ContinueWatchingItem } from '@/types';
 import { cleanFileName, formatDuration, parseMediaInfo } from '@/lib/formatters';
+import { useMediaQuery } from '@/lib/useMediaQuery';
 import { Badge } from '@/components/ui/badge';
 import { ChevronRight, Play, PlayCircle, X } from 'lucide-react';
 
@@ -23,10 +24,11 @@ export const DockedContinueWatching: React.FC<DockedContinueWatchingProps> = ({
 }) => {
   const asideRef = useRef<HTMLElement | null>(null);
   const triggerElementRef = useRef<HTMLElement | null>(null);
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
+  const isMobileOverlay = !isDesktop && Boolean(onClose);
 
   useEffect(() => {
     // Only engage focus trapping/restoration when rendered as mobile/tablet overlay (< 1024px)
-    const isMobileOverlay = typeof window !== 'undefined' && window.innerWidth < 1024 && Boolean(onClose);
     if (!isMobileOverlay) return;
 
     triggerElementRef.current = (document.activeElement && document.activeElement !== document.body)
@@ -89,7 +91,7 @@ export const DockedContinueWatching: React.FC<DockedContinueWatchingProps> = ({
         btn?.focus();
       }, 80);
     };
-  }, [onClose]);
+  }, [isMobileOverlay, onClose]);
 
   return (
     <>
@@ -102,10 +104,14 @@ export const DockedContinueWatching: React.FC<DockedContinueWatchingProps> = ({
 
       <aside
         ref={asideRef}
-        role={typeof window !== 'undefined' && window.innerWidth < 1024 ? 'dialog' : undefined}
-        aria-modal={typeof window !== 'undefined' && window.innerWidth < 1024 ? 'true' : undefined}
+        role={isMobileOverlay ? 'dialog' : undefined}
+        aria-modal={isMobileOverlay ? 'true' : undefined}
         aria-label="Continue Watching Drawer"
-        className="fixed inset-y-0 right-0 z-50 w-72 max-w-[85vw] p-2 bg-background/95 backdrop-blur-xl shadow-2xl lg:static lg:z-auto lg:w-[18%] lg:min-w-[190px] lg:max-w-[260px] lg:p-0 lg:bg-transparent lg:shadow-none shrink-0 h-full flex flex-col min-h-0 animate-in slide-in-from-right-3 duration-200"
+        className={`${
+          isDesktop
+            ? 'static z-auto w-[18%] min-w-[190px] max-w-[260px] p-0 bg-transparent shadow-none'
+            : 'fixed inset-y-0 right-0 z-50 w-72 max-w-[85vw] p-2 bg-background/95 backdrop-blur-xl shadow-2xl'
+        } shrink-0 h-full flex flex-col min-h-0 transition-none animate-in slide-in-from-right-3 duration-200`}
       >
         <div className="h-full flex flex-col min-h-0 p-2 rounded-xl border border-border/70 bg-card/85 backdrop-blur-xl shadow-xs space-y-1.5">
           {/* Header Bar */}

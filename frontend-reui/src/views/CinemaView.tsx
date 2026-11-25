@@ -5,6 +5,7 @@ import { api } from '@/services/api';
 import { socketService } from '@/services/socket';
 import { cleanFileName, formatBytes, formatDuration, parseMediaInfo } from '@/lib/formatters';
 import { scrollRightSideToTop } from '@/lib/scrollUtils';
+import { useMediaQuery } from '@/lib/useMediaQuery';
 import { ChatPickerModal } from '@/components/ChatPickerModal';
 import { DockedChannelPicker } from '@/components/DockedChannelPicker';
 import { DockedContinueWatching } from '@/components/DockedContinueWatching';
@@ -143,10 +144,11 @@ export const CinemaView: React.FC = () => {
     return saved !== 'false';
   });
 
-  const isMobileDrawerActive = typeof window !== 'undefined' && window.innerWidth < 1024 && (isChannelDockOpen || isContinueWatchingOpen);
+  const isDesktopLayout = useMediaQuery('(min-width: 1024px)');
+  const isMobileDrawerActive = !isDesktopLayout && (isChannelDockOpen || isContinueWatchingOpen);
 
   const handleOpenChannelDock = () => {
-    if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+    if (!isDesktopLayout) {
       setContinueWatchingOpen(false);
     }
     setChannelDockOpen(true);
@@ -154,7 +156,7 @@ export const CinemaView: React.FC = () => {
   };
 
   const handleOpenContinueWatching = () => {
-    if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+    if (!isDesktopLayout) {
       setChannelDockOpen(false);
     }
     setContinueWatchingOpen(true);

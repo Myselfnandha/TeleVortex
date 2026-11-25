@@ -2,6 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import type { ChatItem } from '@/types';
 import { api } from '@/services/api';
 import { socketService } from '@/services/socket';
+import { useMediaQuery } from '@/lib/useMediaQuery';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -37,10 +38,11 @@ export const DockedChannelPicker: React.FC<DockedChannelPickerProps> = ({
   const asideRef = useRef<HTMLElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const triggerElementRef = useRef<HTMLElement | null>(null);
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
+  const isMobileOverlay = !isDesktop && Boolean(onClose);
 
   useEffect(() => {
     // Only engage focus trapping/restoration when rendered as mobile/tablet overlay (< 1024px)
-    const isMobileOverlay = typeof window !== 'undefined' && window.innerWidth < 1024 && Boolean(onClose);
     if (!isMobileOverlay) return;
 
     triggerElementRef.current = (document.activeElement && document.activeElement !== document.body)
@@ -105,7 +107,7 @@ export const DockedChannelPicker: React.FC<DockedChannelPickerProps> = ({
         btn?.focus();
       }, 80);
     };
-  }, [onClose]);
+  }, [isMobileOverlay, onClose]);
 
   const loadChats = async (forceRefresh = false) => {
     setLoading(true);
@@ -189,10 +191,14 @@ export const DockedChannelPicker: React.FC<DockedChannelPickerProps> = ({
 
       <aside
         ref={asideRef}
-        role={typeof window !== 'undefined' && window.innerWidth < 1024 && onClose ? 'dialog' : undefined}
-        aria-modal={typeof window !== 'undefined' && window.innerWidth < 1024 && onClose ? 'true' : undefined}
+        role={isMobileOverlay ? 'dialog' : undefined}
+        aria-modal={isMobileOverlay ? 'true' : undefined}
         aria-label="Channels & Chats Drawer"
-        className="fixed inset-y-0 left-0 z-50 w-80 max-w-[85vw] p-2 bg-background/95 backdrop-blur-xl shadow-2xl lg:static lg:z-auto lg:w-[18%] lg:min-w-[190px] lg:max-w-[260px] lg:p-0 lg:bg-transparent lg:shadow-none shrink-0 h-full flex flex-col min-h-0 animate-in slide-in-from-left-3 duration-200"
+        className={`${
+          isDesktop
+            ? 'static z-auto w-[18%] min-w-[190px] max-w-[260px] p-0 bg-transparent shadow-none'
+            : 'fixed inset-y-0 left-0 z-50 w-80 max-w-[85vw] p-2 bg-background/95 backdrop-blur-xl shadow-2xl'
+        } shrink-0 h-full flex flex-col min-h-0 transition-none animate-in slide-in-from-left-3 duration-200`}
       >
         <div className="h-full flex flex-col min-h-0 p-2 rounded-xl border border-border/70 bg-card/85 backdrop-blur-xl shadow-xs space-y-1.5">
           {/* Header Bar */}
